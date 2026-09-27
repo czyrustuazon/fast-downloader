@@ -107,6 +107,12 @@ use and slow routes are still measured in case they recover. This only helps whe
 route has just one connection to begin with. The bottom line shows `N connection(s)
 moved to faster routes`.
 
+**Segments** is the number of connections and can be 1–128. A value outside that range is
+corrected in the box, with a message. To change it for a running download, **Pause**, change
+it, then **Resume**: the new count applies from there, and the pieces already downloaded
+are kept. More connections help until the server's or tunnel's limits are reached; the
+per-route limits above stop you from getting yourself rate-limited.
+
 The bottom status line shows `rate-limited, adapting: direct ≤3 …` while a server is
 pushing back. You don't need to lower **Segments** by hand; it only sets the starting
 point.

@@ -41,6 +41,7 @@ STEAL_MIN = 1024 * 1024           # only steal from segments with at least this 
 STATE_SUFFIX = ".fdl"             # progress record: <name>.part.fdl next to <name>.part
 STATE_SAVE_EVERY = 5.0            # seconds between progress-record saves while downloading
 REPAIR_MARGIN = 1024 * 1024       # re-fetch this much at each edge of recovered ranges
+MAX_CONNECTIONS = 128             # upper limit for the Segments setting
 MAX_RETRIES = 5
 TIMEOUT = 30
 TICK_MS = 200
@@ -868,6 +869,16 @@ class Downloader:
                 self._launch()
             return True
 
+    def set_connections(self, n):
+        """Change the number of connections while paused (takes effect on resume).
+        The pieces are kept; idle connections split the remaining work between them."""
+        with self._lock:
+            if self.state not in ("paused", "error") or not self.segments or not self.ranged:
+                return
+            self.connections = n
+            if n != len(self.workers):
+                self._plan_workers(n)
+
     def _resume_after_prestart(self):
         try:
             self.prestart(lambda: self._cancelled)
@@ -1636,7 +1647,7 @@ class App(tk.Tk):
         seg_box.grid(row=2, column=2, sticky="e", **pad)
         ttk.Label(seg_box, text="Segments").pack(side="left")
         self.seg_var = tk.StringVar(value=str(self.cfg.get("segments", 8)))
-        ttk.Spinbox(seg_box, from_=1, to=32, width=4, textvariable=self.seg_var).pack(side="left", padx=(4, 0))
+        ttk.Spinbox(seg_box, from_=1, to=MAX_CONNECTIONS, width=4, textvariable=self.seg_var).pack(side="left", padx=(4, 0))
 
         ttk.Label(frm, text="Routes").grid(row=3, column=0, sticky="nw", **pad)
         self.routes_txt = tk.Text(frm, height=5, width=40, wrap="none", font=("Consolas", 9))
@@ -1722,13 +1733,23 @@ class App(tk.Tk):
             messagebox.showerror("Fast Downloader", f"Bad route: {e}")
             return None
 
+    def _connections(self, announce=False):
+        """The Segments setting as a connection count, limited to 1..MAX_CONNECTIONS.
+        With `announce`, an out-of-range value is corrected in the box and explained."""
+        raw = self.seg_var.get().strip()
+        try:
+            wanted = int(raw)
+        except ValueError:
+            wanted = 8
+        n = max(1, min(MAX_CONNECTIONS, wanted))
+        if announce and str(n) != raw:
+            self.seg_var.set(str(n))
+            self.status_var.set(f"Segments set to {n} (allowed: 1–{MAX_CONNECTIONS}).")
+        return n
+
     def _max_regions(self):
         """How many VPN regions may be ticked: one per connection, capped at MAX_VPN_TUNNELS."""
-        try:
-            connections = max(1, min(32, int(self.seg_var.get())))
-        except ValueError:
-            connections = 8
-        return min(MAX_VPN_TUNNELS, connections)
+        return min(MAX_VPN_TUNNELS, self._connections())
 
     def _drop_socks_routes(self):
         """Remove 'pia' lines left over from the removed PIA SOCKS route."""
@@ -1850,10 +1871,7 @@ class App(tk.Tk):
         except OSError as e:
             messagebox.showerror("Fast Downloader", f"Cannot use folder:\n{e}")
             return
-        try:
-            n = max(1, min(32, int(self.seg_var.get())))
-        except ValueError:
-            n = 8
+        n = self._connections(announce=True)
         routes = self._routes()
         if not routes:
             return
@@ -1945,6 +1963,7 @@ class App(tk.Tk):
             dl.pause()
         elif dl.state in ("paused", "error"):
             self._reset_speed()
+            dl.set_connections(self._connections(announce=True))   # Segments may have changed
             if not dl.resume():
                 self.start()                      # failed before any data: start over
 
