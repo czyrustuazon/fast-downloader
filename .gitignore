@@ -1,3 +1,4 @@
 .env
+pia_openvpn/
 *.part
 __pycache__/

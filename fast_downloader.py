@@ -18,6 +18,9 @@ Route syntax (one per line in the UI):
                                    PIA_SOCKS_USER / PIA_SOCKS_PASS from the
                                    environment or a .env file next to this script
                                    (see .env.example)
+    vpn:us_east                    a PIA OpenVPN tunnel to that region (needs OpenVPN
+                                   2.7+, PIA_VPN_USER / PIA_VPN_PASS; one UAC prompt
+                                   per connect - see README "PIA over OpenVPN")
 
 Standard library only, except PySocks for SOCKS routes.
 """
@@ -25,6 +28,7 @@ Standard library only, except PySocks for SOCKS routes.
 import collections
 import http.client
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -245,14 +249,34 @@ def _socks_connections(parsed):
     return SocksHTTPConnection, SocksHTTPSConnection
 
 
+def _bound_opener(ip):
+    """An opener whose connections leave from local address `ip`."""
+    src = (str(ip), 0)
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _ConnHTTPHandler(http.client.HTTPConnection, source_address=src),
+        _ConnHTTPSHandler(http.client.HTTPSConnection, source_address=src),
+    )
+
+
 class Route:
     """One way out to the internet. Each has its own urllib opener."""
 
-    def __init__(self, spec, pia=None):
+    def __init__(self, spec, pia=None, vpn=None):
         self.spec = spec.strip()
         s = self.spec
         label = None
-        if s.lower() == "pia":
+        self.tunnel = None
+        self.is_pia = s.lower() == "pia"
+        if s.lower().startswith("vpn:"):
+            if vpn is None:
+                raise ValueError("VPN routes are only available in the app")
+            self.tunnel = vpn.tunnel(s[4:].strip().lower())
+            self.label = f"VPN {self.tunnel.region}"
+            self.is_pia = True
+            self._openers = {}                    # tunnel IP -> opener (IP can change on reconnect)
+            return
+        if self.is_pia:
             s = pia_proxy_url(pia or {})
             label = "PIA " + urllib.parse.urlparse(s).hostname.split(".")[0]
         no_env_proxy = urllib.request.ProxyHandler({})
@@ -268,12 +292,7 @@ class Route:
             ip = None
         if ip is not None:
             self.label = f"bind {ip}"
-            src = (str(ip), 0)
-            self.opener = urllib.request.build_opener(
-                no_env_proxy,
-                _ConnHTTPHandler(http.client.HTTPConnection, source_address=src),
-                _ConnHTTPSHandler(http.client.HTTPSConnection, source_address=src),
-            )
+            self.opener = _bound_opener(ip)
             return
 
         parsed = urllib.parse.urlparse(s)
@@ -291,21 +310,348 @@ class Route:
         else:
             raise ValueError(f"Unsupported proxy scheme: {scheme!r}")
 
+    def _current_opener(self):
+        if self.tunnel is None:
+            return self.opener
+        ip = self.tunnel.ip
+        if not ip:
+            raise IOError(f"VPN {self.tunnel.region} is not connected")
+        if ip not in self._openers:
+            self._openers[ip] = _bound_opener(ip)
+        return self._openers[ip]
+
     def open(self, url, start=None, end=None, timeout=TIMEOUT):
         headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
         if start is not None:
             headers["Range"] = f"bytes={start}-{'' if end is None else end}"
-        return self.opener.open(urllib.request.Request(url, headers=headers), timeout=timeout)
+        return self._current_opener().open(urllib.request.Request(url, headers=headers), timeout=timeout)
 
     def public_ip(self):
         with self.open(IP_CHECK_URL, timeout=15) as resp:
             return resp.read(64).decode().strip()
 
 
-def parse_routes(text, pia=None):
+def parse_routes(text, pia=None, vpn=None):
     specs = [ln.strip() for ln in text.splitlines()
              if ln.strip() and not ln.strip().startswith("#")]
-    return [Route(s, pia) for s in specs] or [Route("direct")]
+    return [Route(s, pia, vpn) for s in specs] or [Route("direct")]
+
+
+# --------------------------------------------------------------------------- #
+# PIA over OpenVPN: "vpn:<region>" routes
+# --------------------------------------------------------------------------- #
+#
+# Each region runs its own openvpn.exe (elevated - Windows only lets admins set up
+# adapters and routes). The tunnel is told NOT to take over the default route:
+# PIA's pushed redirect-gateway / IPv6 routes / DNS are filtered out and replaced by
+# a 0.0.0.0/0 route with metric 9000, which normal traffic never prefers. Sockets
+# bound to the tunnel's IP use that route (Windows picks routes on the interface
+# that owns the source address), so only those connections go through PIA.
+#
+# The app talks to each openvpn over its localhost management interface
+# (password-protected): it supplies the PIA login, watches state, reads the
+# tunnel IP, and sends SIGTERM to disconnect. An elevated watchdog kills the
+# openvpn processes if the app exits without disconnecting them.
+
+OPENVPN_PATHS = [r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+                 r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"]
+PIA_OVPN_ZIP = "https://www.privateinternetaccess.com/openvpn/openvpn.zip"
+PIA_OVPN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pia_openvpn")
+VPN_CONNECT_TIMEOUT = 90
+VPN_ARGS = [
+    "--management-hold", "--management-query-passwords", "--auth-nocache",
+    "--auth-retry", "none",
+    "--pull-filter", "ignore", "redirect-gateway",
+    "--pull-filter", "ignore", "route-ipv6",
+    "--pull-filter", "ignore", "ifconfig-ipv6",
+    "--pull-filter", "ignore", "dhcp-option",
+    "--pull-filter", "ignore", "block-outside-dns",
+    "--route", "0.0.0.0", "0.0.0.0", "vpn_gateway", "9000",
+    "--data-ciphers", "AES-128-GCM:AES-256-GCM:AES-128-CBC",
+    "--data-ciphers-fallback", "AES-128-CBC",
+    "--allow-compression", "asym",
+    "--verb", "3",
+]
+
+
+def find_openvpn():
+    for p in OPENVPN_PATHS:
+        if os.path.exists(p):
+            return p
+    import shutil
+    return shutil.which("openvpn")
+
+
+def pia_regions():
+    """{region: .ovpn path}, downloading PIA's config set on first use."""
+    if not os.path.isdir(PIA_OVPN_DIR) or not any(n.endswith(".ovpn") for n in os.listdir(PIA_OVPN_DIR)):
+        import io, zipfile
+        req = urllib.request.Request(PIA_OVPN_ZIP, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        os.makedirs(PIA_OVPN_DIR, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for name in z.namelist():
+                base = os.path.basename(name)
+                if base.endswith((".ovpn", ".crt", ".pem")):
+                    with open(os.path.join(PIA_OVPN_DIR, base), "wb") as f:
+                        f.write(z.read(name))
+    return {n[:-5].lower(): os.path.join(PIA_OVPN_DIR, n)
+            for n in sorted(os.listdir(PIA_OVPN_DIR)) if n.endswith(".ovpn")}
+
+
+def pia_vpn_credentials():
+    user, password = os.environ.get("PIA_VPN_USER"), os.environ.get("PIA_VPN_PASS")
+    if not user or not password:
+        raise ValueError("VPN routes need your normal PIA login (p…) as "
+                         "PIA_VPN_USER / PIA_VPN_PASS in .env")
+    return user, password
+
+
+def _mgmt_escape(v):
+    return v.replace("\\", "\\\\").replace('"', '\\"')
+
+
+class VpnTunnel:
+    """One openvpn.exe process for one PIA region, driven over its management port."""
+
+    def __init__(self, region, config):
+        self.region, self.config = region, config
+        self.state = "down"          # down | starting | connecting | connected | reconnecting | failed
+        self.ip = None
+        self.error = None
+        self.adapter = None
+        self.log = collections.deque(maxlen=60)     # recent OpenVPN log lines
+        self._sock = None
+        self._send_lock = threading.Lock()
+
+    @property
+    def running(self):
+        return self.state in ("starting", "connecting", "connected", "reconnecting")
+
+    def prepare(self, workdir, adapter):
+        """Pick a management port and password; return the openvpn argument list."""
+        self.adapter = adapter
+        import secrets
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        self.port = s.getsockname()[1]
+        s.close()
+        self._mgmt_pw = secrets.token_hex(16)
+        self._pwfile = os.path.join(workdir, f"mgmt_{self.region}.pw")
+        with open(self._pwfile, "wb") as f:          # binary: a \r would become part of the password
+            f.write(self._mgmt_pw.encode() + b"\n")
+        self.state, self.ip, self.error = "starting", None, None
+        return ["--config", self.config,
+                "--dev-node", adapter, "--disable-dco",
+                "--management", "127.0.0.1", str(self.port), self._pwfile] + VPN_ARGS
+
+    def attach(self, credentials):
+        threading.Thread(target=self._run, args=(credentials,), daemon=True).start()
+
+    def stop(self):
+        self._send("signal SIGTERM")
+
+    def _send(self, cmd):
+        with self._send_lock:
+            if self._sock:
+                try:
+                    self._sock.sendall((cmd + "\r\n").encode())
+                except OSError:
+                    pass
+
+    def _fail(self, msg):
+        if not self.error:
+            self.error = msg
+        self.state = "failed"
+        self.ip = None
+        self.stop()
+
+    def _run(self, credentials):
+        deadline = time.time() + 60                   # UAC prompt + process start
+        while self._sock is None and time.time() < deadline and self.state == "starting":
+            try:
+                self._sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            except OSError:
+                time.sleep(0.5)
+        if self._sock is None:
+            if self.state == "starting":
+                self._fail("OpenVPN did not start")
+            return
+        try:
+            self._session(credentials)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.remove(self._pwfile)
+            except OSError:
+                pass
+            self._sock.close()
+            self._sock = None
+            self.ip = None
+            if self.state != "failed":
+                self.state = "down"
+
+    def _session(self, credentials):
+        self.state = "connecting"
+        self._sock.settimeout(10)
+        self._sock.recv(100)                          # "ENTER PASSWORD:" (no newline)
+        self._sock.settimeout(None)
+        f = self._sock.makefile("r", encoding="utf-8", errors="replace", newline="\n")
+        # OpenVPN drops commands that arrive while it is still answering the previous
+        # one, so they go out one at a time, the next after each SUCCESS/ERROR reply.
+        queue = ["state on", "log on", "hold release"]
+        waiting = True
+        self._send(self._mgmt_pw)
+
+        def next_cmd():
+            nonlocal waiting
+            waiting = bool(queue)
+            if queue:
+                self._send(queue.pop(0))
+
+        for line in f:
+            line = line.strip()
+            if line.startswith(("SUCCESS:", "ERROR:")):
+                if line.startswith("SUCCESS: password is correct"):
+                    try:
+                        os.remove(self._pwfile)
+                    except OSError:
+                        pass
+                if waiting:
+                    next_cmd()
+            elif line.startswith(">LOG:"):
+                self.log.append(line[5:].split(",", 2)[-1])
+            elif line.startswith(">PASSWORD:Need 'Auth'"):
+                user, password = credentials
+                queue.extend([f'username "Auth" "{_mgmt_escape(user)}"',
+                              f'password "Auth" "{_mgmt_escape(password)}"'])
+                if not waiting:
+                    next_cmd()
+            elif line.startswith(">PASSWORD:Verification Failed"):
+                self._fail("PIA rejected the login - PIA_VPN_USER / PIA_VPN_PASS must be "
+                           "your normal PIA login (p…)")
+            elif line.startswith(">FATAL:"):
+                self._fail(line[7:])
+            elif line.startswith(">STATE:"):
+                parts = line[7:].split(",")
+                st = parts[1] if len(parts) > 1 else ""
+                if st == "CONNECTED":
+                    if parts[2] == "SUCCESS" and len(parts) > 3 and parts[3]:
+                        self.ip, self.state = parts[3], "connected"
+                    else:
+                        errors = [m for m in self.log if "ERROR" in m or "FAILED" in m or "failed" in m]
+                        self._fail("connected with errors" + (f": {errors[-1]}" if errors else ""))
+                elif st in ("RECONNECTING", "WAIT", "RESOLVE", "TCP_CONNECT", "AUTH", "GET_CONFIG",
+                            "ASSIGN_IP", "ADD_ROUTES", "AUTH_PENDING"):
+                    self.ip = None
+                    if self.state == "connected":
+                        self.state = "reconnecting"
+                elif st == "EXITING":
+                    self.ip = None
+
+
+class VpnManager:
+    """Owns the app's tunnels: starts them with one UAC prompt, stops them on exit."""
+
+    def __init__(self):
+        self.tunnels = {}
+        self._regions = None
+        self._lock = threading.Lock()
+
+    def regions(self):
+        if self._regions is None:
+            self._regions = pia_regions()
+        return self._regions
+
+    def tunnel(self, region):
+        try:
+            regions = self.regions()
+        except OSError as e:
+            raise ValueError(f"could not download PIA's OpenVPN configs: {describe(e)}") from None
+        if region not in regions:
+            raise ValueError(f"unknown PIA region {region!r} - use 'VPN regions…' to pick one")
+        return self.tunnels.setdefault(region, VpnTunnel(region, regions[region]))
+
+    @property
+    def active(self):
+        return [t for t in self.tunnels.values() if t.running]
+
+    def ensure(self, tunnels, cancelled=lambda: False):
+        """Connect every tunnel in `tunnels` that isn't already up. Blocks; raises on failure."""
+        with self._lock:
+            start = [t for t in dict.fromkeys(tunnels) if not t.running]
+            if start:
+                self._launch(start)
+            deadline = time.time() + VPN_CONNECT_TIMEOUT
+            pending = list(dict.fromkeys(tunnels))
+            while any(t.state in ("starting", "connecting") for t in pending):
+                if cancelled():
+                    return
+                if time.time() > deadline:
+                    for t in pending:
+                        if t.state != "connected":
+                            t._fail("timed out connecting")
+                    break
+                time.sleep(0.3)
+            bad = [t for t in pending if t.state != "connected"]
+            if bad:
+                raise IOError("; ".join(f"VPN {t.region}: {t.error or t.state}" for t in bad))
+
+    def _launch(self, tunnels):
+        import base64, subprocess, tempfile
+        openvpn = find_openvpn()
+        if not openvpn:
+            raise IOError("OpenVPN is not installed - get it from openvpn.net/community")
+        credentials = pia_vpn_credentials()
+        workdir = tempfile.mkdtemp(prefix="fastdl_vpn_")
+        q = lambda v: "'" + v.replace("'", "''") + "'"
+        lines = ["$ErrorActionPreference = 'SilentlyContinue'", "$p = @()", "$new = $false"]
+        # PIA's configs rule out DCO (whose adapters OpenVPN 2.7 creates on demand), so each
+        # tunnel gets its own tap-windows6 adapter, created once and reused afterwards.
+        tapctl = os.path.join(os.path.dirname(openvpn), "tapctl.exe")
+        busy = {t.adapter for t in self.tunnels.values() if t.running and t not in tunnels}
+        free = (f"FastDL VPN {i}" for i in itertools.count(1) if f"FastDL VPN {i}" not in busy)
+        for t in tunnels:
+            adapter = t.adapter = next(free)
+            lines.append(f"if (-not (Get-NetAdapter -Name {q(adapter)})) "
+                         f"{{ & {q(tapctl)} create --hwid 'root\\tap0901' --name {q(adapter)} | Out-Null; $new = $true }}")
+        lines.append("if ($new) { Start-Sleep -Seconds 3 }")   # let Windows finish setting up new adapters
+        # Routes left behind by a tunnel that was killed rather than shut down cleanly
+        clear_routes = [f"Get-NetRoute -InterfaceAlias {q(t.adapter)} -DestinationPrefix '0.0.0.0/0' | "
+                        "Remove-NetRoute -Confirm:$false" for t in tunnels]
+        lines += clear_routes
+        for t in tunnels:
+            args = subprocess.list2cmdline(t.prepare(workdir, t.adapter))
+            lines.append(f"$p += Start-Process -FilePath {q(openvpn)} -ArgumentList {q(args)} "
+                         f"-WorkingDirectory {q(os.path.dirname(t.config))} -WindowStyle Hidden -PassThru")
+        # Watchdog: if the app goes away without disconnecting, take the tunnels down.
+        lines += [f"Wait-Process -Id {os.getpid()}",
+                  "Start-Sleep -Seconds 2",
+                  "$p | Where-Object { -not $_.HasExited } | Stop-Process -Force",
+                  "Start-Sleep -Seconds 1"] + clear_routes
+        encoded = base64.b64encode("\n".join(lines).encode("utf-16-le")).decode()
+        import ctypes
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "powershell.exe",
+            f"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {encoded}",
+            None, 0)
+        if rc <= 32:
+            for t in tunnels:
+                t.state, t.error = "failed", "the administrator (UAC) prompt was declined"
+                try:
+                    os.remove(t._pwfile)
+                except OSError:
+                    pass
+            raise IOError("the administrator (UAC) prompt was declined")
+        for t in tunnels:
+            t.attach(credentials)
+
+    def disconnect_all(self):
+        for t in self.tunnels.values():
+            if t.running:
+                t.stop()
 
 
 def probe(route, url):
@@ -371,10 +717,65 @@ class Worker:
         self.error = None
 
 
-class Downloader:
-    """States: probing -> downloading <-> pausing -> paused -> done | error | cancelled."""
+THROTTLE_CODES = (429, 503)     # "too many requests" / "slow down"
+RAMP_UP_AFTER = 20.0            # quiet seconds before a throttled route may add a connection
 
-    def __init__(self, url, folder, filename, connections, routes):
+
+class RouteGate:
+    """Adaptive connection limit for one route (= one IP address).
+
+    Servers limit connections per IP, each differently (e.g. ~9 vs ~3) and usually
+    without saying so. So the limit is learned, like TCP congestion control: drop it
+    to what the server accepted on a 429/503 (halve it if that keeps happening), add one
+    back after RAMP_UP_AFTER seconds without one. A throttle also
+    pauses the route (2, 4, 8… s, or the server's Retry-After) and spaces out its
+    new requests, which matters for servers that count request rate, not just connections.
+    """
+
+    def __init__(self, start, cap):
+        self.limit = start
+        self.cap = cap
+        self.active = 0
+        self.cool_until = 0.0
+        self.interval = 0.0              # minimum seconds between new requests
+        self.last_start = 0.0
+        self.last_throttle = -RAMP_UP_AFTER
+        self.last_raise = 0.0
+        self.strikes = 0                 # throttles in a row; drives the cooldown length
+        self.throttles = 0               # total, for the UI
+
+    def ready(self, now):
+        return (self.active < self.limit and now >= self.cool_until
+                and now - self.last_start >= self.interval)
+
+    def throttled(self, now, retry_after=None):
+        self.throttles += 1
+        self.strikes += 1
+        # `active` includes the rejected request, so active - 1 is what the server just
+        # accepted - exact for connection caps. Repeated strikes mean something else (a
+        # request-rate limit or a ban), so back off harder.
+        current = min(self.limit, self.active)
+        self.limit = max(1, current - 1 if self.strikes < 3 else current // 2)
+        self.interval = min(2.0, max(0.25, self.interval * 2))
+        self.cool_until = now + (retry_after or min(30, 2 ** self.strikes))
+        self.last_throttle = now
+
+    def accepted(self, now):
+        self.strikes = 0
+        self.interval *= 0.9
+        if (self.limit < self.cap and now - self.last_throttle > RAMP_UP_AFTER
+                and now - self.last_raise > RAMP_UP_AFTER / 2):
+            self.limit += 1
+            self.last_raise = now
+
+
+class Downloader:
+    """States: [connecting ->] probing -> downloading <-> pausing -> paused -> done | error | cancelled.
+
+    `prestart`, if given, runs first on the worker thread (e.g. bringing up VPN tunnels)."""
+
+    def __init__(self, url, folder, filename, connections, routes, prestart=None):
+        self.prestart = prestart
         self.url, self.folder, self.filename = url, folder, filename
         self.connections = connections
         self.routes = routes
@@ -383,7 +784,11 @@ class Downloader:
         self.ranged = False
         self.segments = []
         self.workers = []
-        self.state = "probing"
+        self.route_bytes = collections.Counter()    # route index -> bytes fetched over it
+        self.failovers = []                         # (route label, error) for each failed/throttled request
+        self.gates = []                             # one RouteGate per route
+        self._gate_cond = threading.Condition()
+        self.state = "connecting" if prestart else "probing"
         self.error = None
         self._lock = threading.Lock()       # guards state transitions
         self._seg_lock = threading.Lock()   # guards segment ownership and splitting
@@ -411,10 +816,30 @@ class Downloader:
 
     def resume(self):
         with self._lock:
-            if self.state in ("paused", "error") and self.segments and os.path.exists(self.part):
+            if not (self.state in ("paused", "error") and self.segments and os.path.exists(self.part)):
+                return False
+            if self.prestart:                     # e.g. a VPN tunnel may have dropped meanwhile
+                self.state = "connecting"
+                threading.Thread(target=self._resume_after_prestart, daemon=True).start()
+            else:
                 self._launch()
-                return True
-        return False
+            return True
+
+    def _resume_after_prestart(self):
+        try:
+            self.prestart(lambda: self._cancelled)
+            error = None
+        except Exception as e:
+            error = describe(e)
+        with self._lock:
+            if self._cancelled:
+                self._cleanup()
+                self.state = "cancelled"
+            elif error:
+                self.error = error
+                self.state = "error"
+            else:
+                self._launch()
 
     def cancel(self):
         with self._lock:
@@ -432,7 +857,18 @@ class Downloader:
 
     def _prepare(self):
         try:
-            self.url, self.size, self.ranged, auto_name = probe(self.routes[0], self.url)
+            if self.prestart:
+                self.prestart(lambda: self._cancelled)
+                if self._cancelled:
+                    raise IOError("cancelled")
+                self.state = "probing"
+            for attempt in range(4):              # the probe can be throttled too
+                try:
+                    self.url, self.size, self.ranged, auto_name = probe(self.routes[0], self.url)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code not in THROTTLE_CODES or attempt == 3 or self._stop.wait(2 ** (attempt + 1)):
+                        raise
             self.path = unique_path(os.path.join(self.folder, safe_name(self.filename or auto_name)))
             self.filename = os.path.basename(self.path)
             self.part = self.path + ".part"
@@ -466,6 +902,60 @@ class Downloader:
             n = 1
             self.segments = [Segment(0, None if self.size is None else self.size - 1)]
         self.workers = [Worker(i, i % len(self.routes)) for i in range(n)]
+        share = -(-n // len(self.routes))                 # ceil(n / routes)
+        self.gates = [RouteGate(start=share, cap=n) for _ in self.routes]
+
+    def throttle_note(self):
+        """'' or a short note for the UI when servers have been rate-limiting us lately."""
+        now = time.monotonic()
+        hit = [(r, g) for r, g in zip(self.routes, self.gates) if now - g.last_throttle < 60]
+        if not hit:
+            return ""
+        return "rate-limited, adapting: " + ", ".join(f"{r.label} ≤{g.limit}" for r, g in hit)
+
+    def _acquire(self, w):
+        """Wait for a free slot, preferring the worker's own route. Returns route index or None."""
+        n = len(self.routes)
+        with self._gate_cond:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                home = w.route % n
+                order = [home] + sorted((i for i in range(n) if i != home),
+                                        key=lambda i: self.gates[i].active / self.gates[i].limit)
+                for i in order:
+                    g = self.gates[i]
+                    if g.ready(now):
+                        g.active += 1
+                        g.last_start = now
+                        w.route = i
+                        return i
+                if (w.seg is None or w.seg.finished) and not self._work_left():
+                    w.status = "idle"             # don't sit out a cooldown for nothing
+                    return None
+                w.status = "waiting"
+                self._gate_cond.wait(0.2)
+        return None
+
+    def _work_left(self):
+        """Is there anything an idle worker could still pick up?"""
+        with self._seg_lock:
+            for s in self.segments:
+                if not s.finished and (s.owner is None or
+                                       (self.ranged and self.size and s.remaining >= STEAL_MIN)):
+                    return True
+        return False
+
+    def _release(self, i, throttled=False, retry_after=None):
+        with self._gate_cond:
+            g = self.gates[i]
+            if throttled:
+                g.throttled(time.monotonic(), retry_after)
+            g.active -= 1
+            self._gate_cond.notify_all()
+
+    def _accepted(self, i):
+        with self._gate_cond:
+            self.gates[i].accepted(time.monotonic())
 
     def _launch(self):
         # caller holds self._lock
@@ -529,73 +1019,120 @@ class Downloader:
             self.segments.append(new)
             return new
 
+    def _continue_into(self, w, seg):
+        """`seg` is done and its stream is still open: claim the next piece of the file if
+        nobody is working on it, so the same request keeps going (no new request needed -
+        what matters most on servers that limit request rate)."""
+        with self._seg_lock:
+            for s in self.segments:
+                if (s.start == seg.end + 1 and s.owner is None and not s.finished
+                        and s.done == 0):
+                    s.owner = w
+                    return s
+        return None
+
     def _worker(self, w):
-        seg = w.seg
+        retries = 0
         while not self._stop.is_set():
-            if seg is None or seg.finished:
+            route_idx = self._acquire(w)          # 1. a connection slot on some route
+            if route_idx is None:
+                return
+            seg = w.seg if w.seg is not None and not w.seg.finished else None
+            if seg is None:                       # 2. some work
                 seg = w.seg = self._next_segment(w)
-                if seg is None:
-                    w.status = "idle"
-                    return
-            if not self._fetch(w, seg):           # this connection gave up: hand the work back
+            if seg is None:
+                self._release(route_idx)
+                w.status = "idle"
+                return
+            before = w.bytes
+            outcome = self._fetch(w, seg, route_idx)   # 3. one request; releases the slot
+            if w.bytes > before:
+                retries = 0
+            if outcome in ("ok", "stopped"):
+                continue
+            if outcome == "throttled":
+                # Don't sit on the piece while waiting for a slot: a live stream can
+                # run straight on into it.
                 with self._seg_lock:
-                    seg.owner = None
+                    if w.seg is not None and w.seg.owner is w:
+                        w.seg.owner = None
+                w.seg = None
+                continue
+            label = self.routes[route_idx].label
+            retries += 1
+            if retries > MAX_RETRIES:             # this connection gives up: hand the work back
+                w.error = f"{label}: {describe(outcome)}"
+                with self._seg_lock:
+                    if w.seg is not None and w.seg.owner is w:
+                        w.seg.owner = None
                 w.seg, w.status = None, "failed"
                 return
+            w.status = "retrying"
+            self.failovers.append((label, describe(outcome)))
+            w.route += 1                          # fail over to the next route
+            self._stop.wait(min(2 ** retries, 15))    # without holding a slot
 
-    def _fetch(self, w, seg):
-        """Download `seg` until finished or stopped. Returns False if retries ran out."""
-        retries = 0
-        while not seg.finished and not self._stop.is_set():
-            route_idx = w.route % len(self.routes)
-            route = self.routes[route_idx]
-            w.status = "active"
+    def _fetch(self, w, seg, route_idx):
+        """One request for `seg` (and whatever follows it) on an acquired slot.
+        Returns 'ok', 'stopped', 'throttled', or the exception that ended it."""
+        route = self.routes[route_idx]
+        w.status = "active"
+        throttled, retry_after = False, None
+        try:
             try:
                 if self.ranged:
-                    resp = route.open(self.url, seg.start + seg.done, seg.end)
+                    # Open-ended range: the stream can continue past this piece (see
+                    # _continue_into); it's simply closed when there's nothing more to take.
+                    resp = route.open(self.url, seg.start + seg.done, None)
                     if resp.status != 206:
                         resp.close()
                         raise IOError("server ignored the range request")
                 else:
                     seg.done = 0                  # no ranges: a retry must restart the stream
                     resp = route.open(self.url)
-                with resp, open(self.part, "r+b") as f:
-                    f.seek(seg.start + seg.done)
-                    while not self._stop.is_set():
-                        want = CHUNK if seg.length is None else min(CHUNK, seg.length - seg.done)
-                        if want <= 0:
-                            break                 # reached the end (possibly moved by a steal)
-                        data = resp.read(want)
-                        if not data:
+            except urllib.error.HTTPError as e:
+                if e.code not in THROTTLE_CODES:
+                    raise
+                # Rate-limited: not a failure. The gate lowers this route's limit and
+                # pauses it; the worker hands its piece back and waits for a slot.
+                throttled = True
+                ra = (e.headers.get("Retry-After") or "").strip()
+                retry_after = min(int(ra), 120) if ra.isdigit() else None
+                self.failovers.append((route.label, describe(e)))
+                e.close()
+                return "throttled"
+            self._accepted(route_idx)
+            with resp, open(self.part, "r+b") as f:
+                f.seek(seg.start + seg.done)
+                while not self._stop.is_set():
+                    want = CHUNK if seg.length is None else min(CHUNK, seg.length - seg.done)
+                    if want <= 0:                 # this piece is complete (end may have moved by a steal)
+                        nxt = self._continue_into(w, seg) if self.ranged else None
+                        seg.finished = True
+                        if nxt is None:
                             break
-                        if seg.length is not None:
-                            data = data[:seg.length - seg.done]
-                        f.write(data)
-                        seg.done += len(data)
-                        seg.via = route_idx
-                        w.bytes += len(data)
-                        retries = 0
-                if self._stop.is_set():
-                    break
-                if seg.length is None or seg.done >= seg.length:
-                    seg.finished = True
-                else:
-                    raise IOError("connection closed early")
-            except Exception as e:
-                if self._stop.is_set():
-                    break
-                retries += 1
-                if retries > MAX_RETRIES:
-                    w.error = f"{route.label}: {describe(e)}"
-                    return False
-                w.status = "retrying"
-                w.route += 1                      # fail over to the next route
-                delay = min(2 ** retries, 15)
-                retry_after = getattr(e, "headers", None) and e.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    delay = min(int(retry_after), 60)
-                self._stop.wait(delay)
-        return True
+                        seg = w.seg = nxt         # contiguous: the stream is already at nxt.start
+                        continue
+                    data = resp.read(want)
+                    if not data:
+                        break
+                    if seg.length is not None:
+                        data = data[:seg.length - seg.done]
+                    f.write(data)
+                    seg.done += len(data)
+                    seg.via = route_idx
+                    w.bytes += len(data)
+                    self.route_bytes[route_idx] += len(data)
+            if self._stop.is_set():
+                return "stopped"
+            if seg.length is None or seg.done >= seg.length:
+                seg.finished = True
+                return "ok"
+            raise IOError("connection closed early")
+        except Exception as e:
+            return "stopped" if self._stop.is_set() else e
+        finally:
+            self._release(route_idx, throttled, retry_after)
 
     def _finalize(self):
         if self.size is None:
@@ -643,8 +1180,63 @@ class SpeedMeter:
     def clear(self):
         self.samples.clear()
 ROUTES_HINT = ("# One route per line; connections are spread across them.\n"
-               "# direct | pia | 10.8.0.2 (local/VPN IP) | http://host:port | socks5://user:pass@host:port\n"
+               "# direct | pia | vpn:us_east | 10.8.0.2 | http://host:port | socks5://user:pass@host:port\n"
                "direct\n")
+
+
+class RegionDialog(tk.Toplevel):
+    """Pick PIA OpenVPN regions. Sets self.result to a list of region names."""
+
+    def __init__(self, master, regions):
+        super().__init__(master)
+        self.title("PIA VPN regions")
+        self.transient(master)
+        self.geometry("360x460")
+        self.regions = regions
+        self.result = None
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, wraplength=330, justify="left", text=(
+            "Each region you add becomes its own tunnel and IP (vpn:<region>). "
+            "Ctrl/Shift-click to pick several.")).pack(anchor="w", pady=(0, 6))
+        self.filter_var = tk.StringVar()
+        entry = ttk.Entry(frm, textvariable=self.filter_var)
+        entry.pack(fill="x")
+        entry.insert(0, "us")
+        entry.focus_set()
+        self.filter_var.trace_add("write", lambda *a: self._fill())
+
+        box = ttk.Frame(frm)
+        box.pack(fill="both", expand=True, pady=6)
+        self.listbox = tk.Listbox(box, selectmode="extended", activestyle="none")
+        sb = ttk.Scrollbar(box, command=self.listbox.yview)
+        self.listbox.config(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.listbox.bind("<Double-Button-1>", lambda e: self.add())
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e")
+        ttk.Button(btns, text="Add", command=self.add).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.add())
+        self._fill()
+        self.grab_set()
+
+    def _fill(self):
+        words = self.filter_var.get().lower().split()
+        self.shown = [r for r in self.regions if all(w in r for w in words)]
+        self.listbox.delete(0, "end")
+        for r in self.shown:
+            self.listbox.insert("end", r)
+
+    def add(self):
+        picked = [self.shown[i] for i in self.listbox.curselection()]
+        if picked:
+            self.result = picked
+            self.destroy()
 
 
 class PiaDialog(tk.Toplevel):
@@ -755,7 +1347,8 @@ class App(tk.Tk):
         self._last_state = None
         self.cfg = load_config()
         self.pia = self.cfg.get("pia", {})
-        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_downloader.ico")
+        self.vpn = VpnManager()
+        icon =os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_downloader.ico")
         if os.path.exists(icon):
             try:
                 self.iconbitmap(default=icon)
@@ -802,9 +1395,20 @@ class App(tk.Tk):
         route_btns = ttk.Frame(frm)
         route_btns.grid(row=3, column=2, sticky="n", **pad)
         ttk.Button(route_btns, text="PIA…", command=self.pia_settings).pack(fill="x", pady=(0, 4))
-        ttk.Button(route_btns, text="Add local IPs", command=self.add_local_ips).pack(fill="x", pady=(0, 4))
+        ttk.Button(route_btns, text="VPN regions…", command=self.vpn_regions).pack(fill="x", pady=(0, 4))
+        self.local_btn = ttk.Button(route_btns, text="Add local IPs", command=self.add_local_ips)
+        self.local_btn.pack(fill="x", pady=(0, 4))
         self.check_btn = ttk.Button(route_btns, text="Check IPs", command=self.check_ips)
-        self.check_btn.pack(fill="x")
+        self.check_btn.pack(fill="x", pady=(0, 4))
+        self.vpn_btn = ttk.Button(route_btns, text="Disconnect VPN", command=self.vpn.disconnect_all,
+                                  state="disabled")
+        self.vpn_btn.pack(fill="x")
+        self.vpn_var = tk.StringVar()
+        ttk.Label(route_btns, textvariable=self.vpn_var, foreground="#666").pack(anchor="w")
+        self.pia_only_var = tk.BooleanVar(value=bool(self.cfg.get("pia_only")))
+        ttk.Checkbutton(route_btns, text="PIA only", variable=self.pia_only_var,
+                        command=self._pia_only_changed).pack(anchor="w", pady=(4, 0))
+        self._pia_only_changed()
 
         btns = ttk.Frame(frm)
         btns.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
@@ -838,18 +1442,49 @@ class App(tk.Tk):
 
     def _routes(self):
         try:
-            return parse_routes(self.routes_txt.get("1.0", "end"), self.pia)
+            if self.pia_only_var.get():
+                # Keep only PIA routes (pia / vpn:*); every connection, the initial probe
+                # and any failover then stay on PIA, so your own IP is never used.
+                text = self.routes_txt.get("1.0", "end")
+                specs = [ln.strip() for ln in text.splitlines()
+                         if ln.strip().lower() == "pia" or ln.strip().lower().startswith("vpn:")]
+                return parse_routes("\n".join(specs) or "pia", self.pia, self.vpn)
+            return parse_routes(self.routes_txt.get("1.0", "end"), self.pia, self.vpn)
         except ValueError as e:
             messagebox.showerror("Fast Downloader", f"Bad route: {e}")
             return None
+
+    def _prestart_for(self, routes):
+        """If any route is a VPN tunnel, a callable that connects them (else None)."""
+        tunnels = [r.tunnel for r in routes if r.tunnel]
+        if not tunnels:
+            return None
+        return lambda cancelled: self.vpn.ensure(tunnels, cancelled)
+
+    def _pia_only_changed(self):
+        self.local_btn.config(state="disabled" if self.pia_only_var.get() else "normal")
+
+    def vpn_regions(self):
+        try:
+            regions = list(self.vpn.regions())
+        except OSError as e:
+            messagebox.showerror("Fast Downloader", f"Could not download PIA's region list:\n{describe(e)}")
+            return
+        dlg = RegionDialog(self, regions)
+        self.wait_window(dlg)
+        if dlg.result:
+            self._append_routes([f"vpn:{r}" for r in dlg.result])
 
     def _append_routes(self, specs):
         existing = {ln.strip().lower() for ln in self.routes_txt.get("1.0", "end").splitlines()}
         new = [s for s in specs if s.lower() not in existing]
         if new:
+            prev = self.routes_txt.cget("state")
+            self.routes_txt.config(state="normal")    # insert is ignored while disabled
             if self.routes_txt.get("end-2c", "end-1c") != "\n":
                 self.routes_txt.insert("end-1c", "\n")
             self.routes_txt.insert("end-1c", "\n".join(new) + "\n")
+            self.routes_txt.config(state=prev)
 
     def add_local_ips(self):
         ips = local_ipv4s()
@@ -877,6 +1512,7 @@ class App(tk.Tk):
             routes=self.routes_txt.get("1.0", "end-1c"),
             folder=self.dir_var.get().strip(),
             segments=self.seg_var.get().strip(),
+            pia_only=self.pia_only_var.get(),
         )
         save_config(self.cfg)
 
@@ -886,8 +1522,15 @@ class App(tk.Tk):
             return
         self.check_btn.config(state="disabled", text="Checking…")
 
+        prestart = self._prestart_for(routes)
+
         def work():
             lines = []
+            if prestart:
+                try:
+                    prestart(lambda: False)
+                except Exception as e:
+                    lines.append(f"VPN: {describe(e)}")
             for r in routes:
                 try:
                     lines.append(f"{r.label:<32} →  {r.public_ip()}")
@@ -902,7 +1545,7 @@ class App(tk.Tk):
         messagebox.showinfo("Public IP per route", "\n".join(lines))
 
     def start(self):
-        if self.dl and self.dl.state in ("probing", "downloading", "pausing", "paused"):
+        if self.dl and self.dl.state in ("connecting", "probing", "downloading", "pausing", "paused"):
             return
         url = self.url_var.get().strip()
         if not url:
@@ -925,7 +1568,8 @@ class App(tk.Tk):
         if not routes:
             return
         self._reset_speed()
-        self.dl = Downloader(url, folder, self.name_var.get().strip() or None, n, routes)
+        self.dl = Downloader(url, folder, self.name_var.get().strip() or None, n, routes,
+                             prestart=self._prestart_for(routes))
         self.dl.start()
 
     def toggle_pause(self):
@@ -948,16 +1592,18 @@ class App(tk.Tk):
             self.dl.cancel()
 
     def _on_close(self):
-        if self.dl and self.dl.state in ("probing", "downloading", "pausing"):
+        if self.dl and self.dl.state in ("connecting", "probing", "downloading", "pausing"):
             if not messagebox.askyesno("Fast Downloader", "A download is in progress. Quit anyway?"):
                 return
             self.dl.stop()
+        self.vpn.disconnect_all()     # the elevated watchdog also stops them once we exit
         self._save_settings()
         self.destroy()
 
     # -- periodic UI refresh ------------------------------------------------ #
 
     def _tick(self):
+        self._refresh_vpn()
         dl = self.dl
         if dl:
             if dl.state != self._last_state:
@@ -966,9 +1612,21 @@ class App(tk.Tk):
             self._refresh(dl)
         self.after(TICK_MS, self._tick)
 
+    def _refresh_vpn(self):
+        tunnels = [t for t in self.vpn.tunnels.values() if t.running]
+        up = sum(t.state == "connected" for t in tunnels)
+        if not tunnels:
+            text = ""
+        elif up == len(tunnels):
+            text = f"VPN: {up} connected"
+        else:
+            text = f"VPN: {up}/{len(tunnels)} connected…"
+        self.vpn_var.set(text)
+        self.vpn_btn.config(state="normal" if tunnels else "disabled")
+
     def _on_state(self, dl):
         s = dl.state
-        busy = s in ("probing", "downloading", "pausing", "paused")
+        busy = s in ("connecting", "probing", "downloading", "pausing", "paused")
         self.start_btn.config(state="disabled" if busy else "normal")
         self.cancel_btn.config(state="normal" if busy or s == "error" else "disabled")
         if s == "downloading":
@@ -1000,7 +1658,9 @@ class App(tk.Tk):
         pct = f" ({100 * done / dl.size:.1f}%)" if dl.size else ""
         amount = f"{human_size(done)} / {human_size(dl.size)}{pct}"
         s = dl.state
-        if s == "probing":
+        if s == "connecting":
+            text = "Connecting VPN… (approve the administrator prompt if Windows asks)"
+        elif s == "probing":
             text = "Contacting server…"
         elif s in ("downloading", "pausing"):
             eta = (dl.size - done) / speed if dl.size and speed > 0 else None
@@ -1021,6 +1681,11 @@ class App(tk.Tk):
             n_routes = len({w.route % len(dl.routes) for w in dl.workers})
             mode = ("resumable, idle connections take over slow parts" if dl.ranged
                     else "server doesn't support ranges — single connection")
+            if all(r.is_pia for r in dl.routes):
+                mode = "PIA only  ·  " + mode
+            note = dl.throttle_note()
+            if note:
+                mode = note + "  ·  " + mode
             self.info_var.set(f"{dl.filename}  ·  {human_size(dl.size)}  ·  {len(dl.workers)} "
                               f"connection(s) over {n_routes} route(s)  ·  {mode}")
         self._draw(dl)
@@ -1075,7 +1740,7 @@ class App(tk.Tk):
             if wk.status == "active" and seg:
                 state = f"{frac * 100:5.1f}%" if seg.length else "  ... "
             else:
-                state = {"retrying": "retry ", "failed": "FAILED"}.get(wk.status, " idle ")
+                state = {"retrying": "retry ", "failed": "FAILED", "waiting": " wait "}.get(wk.status, " idle ")
             rate = self.wspeed[wk.idx].rate() if wk.status == "active" else 0.0
             label = dl.route_label(route)
             label = label if len(label) <= 20 else label[:19] + "…"
