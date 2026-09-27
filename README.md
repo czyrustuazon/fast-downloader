@@ -44,6 +44,25 @@ them in turn; list a route twice to give it more connections.
 Your own IP is never used for downloading, even if a tunnel fails; the download
 stops with an error instead. Site names are still looked up by your own DNS.
 
+## Pausing, resuming and fixing broken downloads
+
+- **Pause / Resume** stops and continues the current download without losing anything.
+- **Close the app mid-download** and the progress is kept. Click **Download** again with
+  the same URL, or use **Resume file…**, and it continues where it stopped. On launch,
+  the status line lists any unfinished downloads in the save folder.
+- **Broken downloads** (the app crashed, the PC restarted, or the file came from an older
+  version) are recovered too. Use the same URL, or **Resume file…** with the URL pasted in
+  the URL box. The app works out which parts of the `.part` file were already
+  downloaded and fetches only the rest.
+- Before continuing, the app checks the file on the server is still the same (size and
+  `ETag`/`Last-Modified`). If it changed, the old partial file is left alone and the
+  download starts fresh under a new name, so stale and new data are never mixed.
+- **Cancel** deletes the partial file (it asks first). To stop for now, use **Pause** or
+  close the app.
+
+Resuming needs a server that supports byte ranges (almost all do). A download from a
+server without them can't be continued and restarts from the beginning.
+
 ## Rate limiting
 
 Many servers cap how hard **one IP address** can hit them, and answer
@@ -66,6 +85,15 @@ The app adapts automatically, per route (each route is its own IP):
   hands its piece back so a running stream can carry on through it. On OVH this cut a
   100 MB download from 267 s to 6 s.
 
+**Connections follow the speed.** Every 3 s the app measures each route's speed *per
+connection*. If a route with more than one connection runs at under 60% of the fastest,
+one of its connections moves to the fastest route. It keeps its piece and carries on
+from the same byte. Every route keeps at least one connection, so all your IPs stay in
+use and slow routes are still measured in case they recover. This only helps when
+**Segments** is larger than the number of routes; with 8 regions and 8 segments each
+route has just one connection to begin with. The bottom line shows `N connection(s)
+moved to faster routes`.
+
 The bottom status line shows `rate-limited, adapting: direct ≤3 …` while a server is
 pushing back. You don't need to lower **Segments** by hand; it only sets the starting
 point.
@@ -87,8 +115,12 @@ connection.
    PIA_VPN_USER=p1234567
    PIA_VPN_PASS="your-normal-pia-password"
    ```
-3. Click **VPN regions…**, filter (for example `us`), select one or more regions, and click **Add**.
-   Each becomes a `vpn:<region>` line. PIA's config files are downloaded to `pia_openvpn/` the first time.
+3. Click **VPN regions…**, type to filter (for example `us`), tick the regions you want,
+   and click **Save**. Ticked regions become `vpn:<region>` lines, replacing any previous
+   ones. You can tick **up to your Segments setting, at most 8**: each region needs at
+   least one connection, and all tunnels start from one elevated command. At the
+   limit, the remaining boxes are disabled until you untick one. PIA's config files are
+   downloaded to `pia_openvpn/` the first time.
 4. **Disconnect the PIA app** and turn off its killswitch. It conflicts with separate tunnels.
 
 ### Using it
@@ -168,8 +200,23 @@ dl.start()          # runs on background threads; poll dl.state / dl.downloaded
   errors retry with backoff (2, 4, 8… s, max 15 s) and switch the worker to the next route.
   After `MAX_RETRIES` (5) in a row without progress, the worker hands its piece back and
   stops. The download only fails if every worker has stopped this way.
-- **Pause/resume** keeps pieces, learned route limits and tunnels. It works only while the
-  app is open; progress isn't saved to disk.
+- **Progress record:** `<name>.part.fdl` (JSON) holds the original and final URL, size,
+  `ETag`, `Last-Modified` and every piece as `[start, end, done]`. It's written atomically
+  (a temp file, then `os.replace`) every `STATE_SAVE_EVERY` (5) seconds while downloading,
+  on pause or error, and when the app closes. It's deleted when the download completes or
+  is cancelled. A lock plus a "final" flag stop a late autosave from re-creating it after
+  completion.
+- **Resuming:** after the probe, `_load_partial()` looks for `<target>.part`. The size must
+  match, and any `ETag`/`Last-Modified` in the record must equal the server's. Pieces
+  are rebuilt from the record and each continues at `start + done`. If nothing matches,
+  `unique_path()` picks a name whose file *and* `.part` are both free.
+- **Repair without a record:** the `.part` is sparse, so `FSCTL_QUERY_ALLOCATED_RANGES`
+  (`allocated_ranges()`) returns exactly the ranges that were ever written.
+  `segments_from_runs()` turns those into finished pieces and the gaps into pieces still
+  to fetch. It trims `REPAIR_MARGIN` (1 MiB) from both ends of each range, because a
+  range's last write may have been cut short and its start is rounded down to a cluster
+  boundary. A non-sparse file can't be told apart this way, so it isn't reused.
+- **Pause/resume** within a session keeps pieces, learned route limits and tunnels.
 - **Servers without range support** get a single plain GET, restarted from zero on retry.
 
 ### Routes
@@ -202,9 +249,19 @@ Each `Route` wraps a `urllib` opener:
   - `--pull-filter ignore` for `redirect-gateway`, `route-ipv6`, `ifconfig-ipv6`,
     `dhcp-option` and `block-outside-dns`, so the server can't take over routing or DNS;
   - `--route 0.0.0.0 0.0.0.0 vpn_gateway 9000`;
+  - `--sndbuf 524288 --rcvbuf 524288`, with pushed `sndbuf`/`rcvbuf` ignored. OpenVPN's small
+    default buffers on Windows collapse throughput. Measured to PIA US West from
+    archive.org: **0.1 MB/s per connection by default, 3.9 MB/s with 512 KB**
+    (1.2 vs 6.5 MB/s with 4 connections);
   - `--data-ciphers AES-128-GCM:AES-256-GCM:AES-128-CBC` (PIA negotiates GCM);
   - `--allow-compression asym`;
   - `--management-hold --management-query-passwords --auth-nocache --auth-retry none`.
+- **One session per server.** PIA gives an account the *same* tunnel IP on a given server,
+  so two sessions to one server collide: the later one breaks the earlier one. Each region
+  is a different server, so one tunnel per region is safe.
+- **DCO doesn't work with PIA.** A DCO tunnel (AEAD only, compression removed) connects but
+  passes no traffic, because PIA's servers use compression framing ("stub"), which DCO
+  doesn't support. Tunnels stay on tap-windows6.
 - **Routing:** Windows uses the strong host model, so a socket bound to the tunnel IP only
   uses routes on that interface. That makes the tunnel's metric-9000 default route
   apply only to bound sockets.
@@ -227,6 +284,7 @@ Each `Route` wraps a `urllib` opener:
 |---|---|
 | `.env` (git-ignored) | `PIA_VPN_USER/PASS` (your `p…` PIA login). Parsed by `load_dotenv()`: `KEY=VALUE`, quotes, `export`, `#` comments. Real environment variables win. |
 | `%USERPROFILE%\.fast_downloader.json` | routes, folder, segment count, PIA-only (no credentials) |
+| `<name>.part` + `<name>.part.fdl` | an unfinished download (sparse file) and its progress record |
 | `pia_openvpn/` (git-ignored) | cached PIA OpenVPN configs |
 | `%TEMP%\fastdl_vpn_*` | per-connect management password files (deleted once used) |
 | `fast_downloader.ico`, `create_shortcut.ps1` | icon; creates Desktop and Start Menu shortcuts running `pythonw.exe` (no console) |
@@ -234,10 +292,69 @@ Each `Route` wraps a `urllib` opener:
 Tunable constants are at the top of the file: `CHUNK`, `MIN_SEGMENT`, `STEAL_MIN`,
 `MAX_RETRIES`, `TIMEOUT`, `RAMP_UP_AFTER`, `VPN_CONNECT_TIMEOUT` and `VPN_ARGS`.
 
+### Findings
+
+Measured or discovered while building this (Windows 11, 1 Gbps line, September 2026).
+They explain several design choices above.
+
+**Throughput**
+
+| Test | Result |
+|---|---|
+| archive.org, direct, 1 / 4 / 8 connections | 7.2 / 16.7 / ~22 MB/s: per-connection speed is the limit, not the line (1 Gbps ≈ 125 MB/s) |
+| PIA US West tunnel, OpenVPN default buffers, 1 / 4 connections | **0.1 / 1.2 MB/s** |
+| Same, `--sndbuf/--rcvbuf 524288`, 1 / 4 connections | **3.9 / 6.5 MB/s**, repeatable on a second server |
+| 8 regions (Europe, Canada, US East/South) × 1 connection each, default buffers | ~8.5 MB/s total, 0.27–1.5 MB/s per connection, to a California server |
+
+Takeaways:
+- **Buffers:** always raise OpenVPN's socket buffers on Windows.
+- **Region choice:** pick regions near the file's server; every connection goes you → PIA → server.
+- **Connections:** give each route several connections (Segments > number of routes), so rebalancing can shift them to the fast ones.
+
+**Server rate limits** (probed with tiny parallel range requests)
+
+| Server | Behaviour |
+|---|---|
+| Hetzner speed test (`fsn1-speed.hetzner.com`) | ~9 connections per IP; the rest get `429` |
+| OVH (`proof.ovh.net`) | ~3 connections per IP, then about one *new request* per 10–20 s, for a while |
+
+Neither sends `Retry-After` or rate-limit headers. That's why limits are learned per
+route, and why requests are open-ended and streams carry on into the next piece. On OVH,
+100 MB with 8 connections took 267 s with one request per piece and 6 s with streams
+carrying on.
+
+**PIA**
+
+- **OpenVPN:**
+  - **Regions:** OpenVPN works in all 166 regions, with your normal `p…` login.
+  - **Cipher:** servers negotiate `AES-128-GCM`, but still require compression framing ("stub"). That rules out OpenVPN 2.7's DCO driver: a DCO tunnel connects but passes no traffic.
+  - **Sessions:** one account gets the **same tunnel IP** on a given server, so parallel sessions to one server break each other. Use one tunnel per region, never two to the same server.
+  - **Pushed settings:** servers push `redirect-gateway def1`, `route-ipv6 2000::/3` and a DNS server. All are filtered out so that only bound connections use the tunnel.
+- **SOCKS5 proxy (removed):** Netherlands only (`proxy-nl…`, about 30 servers).
+  - It needs separate `x…` credentials, which can be revoked.
+  - It fails remote DNS (`socks5h`) with *0x04 Host unreachable*.
+  - It was replaced by OpenVPN.
+
+**OpenVPN on Windows**
+
+- **Drivers:** 2.7 creates adapters on demand only for DCO. With tap-windows6 (needed here), each simultaneous tunnel needs its own adapter (`tapctl create --hwid root\tap0901`).
+- **New adapters:** a freshly created tap adapter can make the first connect report `CONNECTED,ERROR`. A short pause after creating it avoids this.
+- **Leftover routes:** a tunnel killed rather than stopped cleanly leaves its `0.0.0.0/0` route behind on the tap adapter. It's harmless because the adapter is disconnected, but it's cleared on the next launch and by the watchdog.
+- **Management interface:**
+  - It drops commands that arrive while it's still answering the previous one, so send one at a time and wait for `SUCCESS:`/`ERROR:`.
+  - The password file must end in `\n`, not `\r\n`; the `\r` becomes part of the password.
+- **Log file:** an elevated `openvpn.exe` creates its `--log` file readable only by administrators, so logs are read through the management interface (`log on`).
+
+**Windows file I/O**
+
+- **Preallocating:** `truncate()` extends a file by physically writing zeros. A 250 GB download wrote 35 GB of zeros before this was noticed. Marking the file sparse first (`FSCTL_SET_SPARSE`) makes setting its size instant.
+- **Recovery:** a sparse file's allocated ranges (`FSCTL_QUERY_ALLOCATED_RANGES`) show exactly what was written. A 232 GB partial download that had lost its progress record came back as 8 runs, one per segment start, and 931 MB of it was recoverable.
+
 ### Known limitations
 
-- Progress isn't saved to disk, so a download can't be resumed after the app closes.
 - Only one download at a time.
+- Repairing a download that lost its progress record needs Windows and a sparse `.part`
+  (every `.part` this version creates is sparse).
 - Site names are always resolved by your own DNS, including for `vpn:` routes.
 - `vpn:` routes are Windows-only and need administrator rights. They don't coexist with
   the PIA app while it's connected.

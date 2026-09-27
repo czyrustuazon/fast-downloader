@@ -38,6 +38,9 @@ from tkinter import filedialog, messagebox, ttk
 CHUNK = 64 * 1024
 MIN_SEGMENT = 256 * 1024          # never split into pieces smaller than this
 STEAL_MIN = 1024 * 1024           # only steal from segments with at least this much left
+STATE_SUFFIX = ".fdl"             # progress record: <name>.part.fdl next to <name>.part
+STATE_SAVE_EVERY = 5.0            # seconds between progress-record saves while downloading
+REPAIR_MARGIN = 1024 * 1024       # re-fetch this much at each edge of recovered ranges
 MAX_RETRIES = 5
 TIMEOUT = 30
 TICK_MS = 200
@@ -83,13 +86,59 @@ def safe_name(name):
 
 
 def unique_path(path):
-    if not os.path.exists(path):
+    """`path`, or `name (1).ext`, `name (2).ext`… - skipping names whose file *or*
+    partial download (.part) already exists, so neither gets overwritten."""
+    taken = lambda p: os.path.exists(p) or os.path.exists(p + ".part")
+    if not taken(path):
         return path
     base, ext = os.path.splitext(path)
     i = 1
-    while os.path.exists(f"{base} ({i}){ext}"):
+    while taken(f"{base} ({i}){ext}"):
         i += 1
     return f"{base} ({i}){ext}"
+
+
+def allocated_ranges(path):
+    """[(start, end_exclusive)] of the parts of a *sparse* file that hold data, or None.
+
+    Windows only. Downloads are written into sparse files, so the ranges that were
+    ever written are exactly the allocated ones - which lets a partial download
+    that lost its progress record be recovered. Non-sparse files are fully
+    allocated, so they return None (nothing can be told apart)."""
+    if os.name != "nt":
+        return None
+    import ctypes, msvcrt, stat
+    from ctypes import wintypes
+    try:
+        if not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_SPARSE_FILE:
+            return None
+    except OSError:
+        return None
+
+    class Range(ctypes.Structure):
+        _fields_ = [("offset", ctypes.c_longlong), ("length", ctypes.c_longlong)]
+
+    FSCTL_QUERY_ALLOCATED_RANGES, ERROR_MORE_DATA = 0x940CF, 234
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    size = os.path.getsize(path)
+    ranges, start = [], 0
+    out = (Range * 1024)()
+    with open(path, "rb") as f:
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno()))
+        while start < size:
+            query = Range(start, size - start)
+            returned = wintypes.DWORD()
+            ok = kernel32.DeviceIoControl(handle, FSCTL_QUERY_ALLOCATED_RANGES,
+                                          ctypes.byref(query), ctypes.sizeof(query),
+                                          out, ctypes.sizeof(out), ctypes.byref(returned), None)
+            n = returned.value // ctypes.sizeof(Range)
+            ranges += [(out[i].offset, out[i].offset + out[i].length) for i in range(n)]
+            if ok:
+                break
+            if ctypes.get_last_error() != ERROR_MORE_DATA or n == 0:
+                return None
+            start = ranges[-1][1]
+    return ranges
 
 
 def set_size_sparse(f, size):
@@ -303,6 +352,7 @@ OPENVPN_PATHS = [r"C:\Program Files\OpenVPN\bin\openvpn.exe",
 PIA_OVPN_ZIP = "https://www.privateinternetaccess.com/openvpn/openvpn.zip"
 PIA_OVPN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pia_openvpn")
 VPN_CONNECT_TIMEOUT = 90
+MAX_VPN_TUNNELS = 8        # all tunnels start from one elevated command line; keep it well short
 VPN_ARGS = [
     "--management-hold", "--management-query-passwords", "--auth-nocache",
     "--auth-retry", "none",
@@ -311,6 +361,12 @@ VPN_ARGS = [
     "--pull-filter", "ignore", "ifconfig-ipv6",
     "--pull-filter", "ignore", "dhcp-option",
     "--pull-filter", "ignore", "block-outside-dns",
+    # OpenVPN's default socket buffers on Windows are small: measured to PIA US West,
+    # 0.1 MB/s per connection with them vs 3.9 MB/s with 512 KB. Don't let the server
+    # push them back down.
+    "--sndbuf", "524288", "--rcvbuf", "524288",
+    "--pull-filter", "ignore", "sndbuf",
+    "--pull-filter", "ignore", "rcvbuf",
     "--route", "0.0.0.0", "0.0.0.0", "vpn_gateway", "9000",
     "--data-ciphers", "AES-128-GCM:AES-256-GCM:AES-128-CBC",
     "--data-ciphers-fallback", "AES-128-CBC",
@@ -599,25 +655,30 @@ class VpnManager:
                 t.stop()
 
 
+ProbeResult = collections.namedtuple("ProbeResult", "url size ranged name etag modified")
+
+
 def probe(route, url):
-    """Return (final_url, size or None, supports_ranges, suggested_filename)."""
+    """What the server says about `url`: final URL after redirects, size (or None),
+    range support, a filename, and its version markers (ETag / Last-Modified)."""
+    def result(resp, size, ranged):
+        final = resp.geturl()
+        return ProbeResult(final, size, ranged, filename_from(resp, final),
+                           resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
     try:
         with route.open(url, 0, 0) as resp:
-            final = resp.geturl()
-            name = filename_from(resp, final)
             if resp.status == 206:
                 m = re.match(r"bytes\s+\d+-\d+/(\d+)", resp.headers.get("Content-Range", ""))
                 if m:
-                    return final, int(m.group(1)), True, name
+                    return result(resp, int(m.group(1)), True)
             length = resp.headers.get("Content-Length")
-            return final, int(length) if length else None, False, name
+            return result(resp, int(length) if length else None, False)
     except urllib.error.HTTPError as e:
         if e.code != 416:  # 416 = empty file / range not satisfiable; retry without range
             raise
     with route.open(url) as resp:
-        final = resp.geturl()
         length = resp.headers.get("Content-Length")
-        return final, int(length) if length else None, False, filename_from(resp, final)
+        return result(resp, int(length) if length else None, False)
 
 
 # --------------------------------------------------------------------------- #
@@ -649,6 +710,32 @@ class Segment:
         return self.done / self.length if self.length else 0.0
 
 
+def segments_from_runs(size, runs, margin):
+    """Segments covering [0, size): finished ones for the data `runs`, empty ones for the gaps.
+
+    Each run is trimmed by `margin` at both ends (not at offset 0): a run's last write
+    may have been cut short, and its start is rounded down to a cluster boundary, so
+    the edges can hold zeros that were never downloaded."""
+    done = []
+    for a, b in sorted(runs):
+        a, b = (a if a == 0 else a + margin), min(b, size) - margin
+        if b > a:
+            if done and a <= done[-1][1]:
+                done[-1][1] = max(done[-1][1], b)
+            else:
+                done.append([a, b])
+    segs, pos = [], 0
+    for a, b in done + [[size, size]]:
+        if a > pos:
+            segs.append(Segment(pos, a - 1))                 # still to download
+        if b > a:
+            s = Segment(a, b - 1)
+            s.done, s.finished = s.length, True
+            segs.append(s)
+        pos = max(pos, b)
+    return segs
+
+
 class Worker:
     """One connection. Keeps pulling work - its own segment, then stolen halves -
     until nothing worth taking is left."""
@@ -660,10 +747,13 @@ class Worker:
         self.bytes = 0
         self.status = "idle"                # active | retrying | idle | failed
         self.error = None
+        self.move = False                   # set by the rebalancer: end this request, reconnect on self.route
 
 
 THROTTLE_CODES = (429, 503)     # "too many requests" / "slow down"
 RAMP_UP_AFTER = 20.0            # quiet seconds before a throttled route may add a connection
+REBALANCE_EVERY = 3.0           # seconds between rebalancing checks
+REBALANCE_RATIO = 0.6           # move a connection when a route runs < 60% of the best route's speed
 
 
 class RouteGate:
@@ -719,9 +809,15 @@ class Downloader:
 
     `prestart`, if given, runs first on the worker thread (e.g. bringing up VPN tunnels)."""
 
-    def __init__(self, url, folder, filename, connections, routes, prestart=None):
+    def __init__(self, url, folder, filename, connections, routes, prestart=None, resume_part=None):
         self.prestart = prestart
         self.url, self.folder, self.filename = url, folder, filename
+        self.orig_url = url                 # as entered; self.url becomes the final URL after redirects
+        self.resume_part = resume_part      # a specific .part the user asked to continue
+        self.etag = self.modified = None
+        self.note = ""                      # e.g. "resumed: 1.2 GB already downloaded"
+        self._state_lock = threading.Lock()   # guards the progress record file
+        self._state_final = False
         self.connections = connections
         self.routes = routes
         self.path = self.part = None
@@ -731,6 +827,8 @@ class Downloader:
         self.workers = []
         self.route_bytes = collections.Counter()    # route index -> bytes fetched over it
         self.failovers = []                         # (route label, error) for each failed/throttled request
+        self.route_rate = {}                        # route index -> measured bytes/s per connection
+        self.moves = 0                              # connections moved to faster routes
         self.gates = []                             # one RouteGate per route
         self._gate_cond = threading.Condition()
         self.state = "connecting" if prestart else "probing"
@@ -809,24 +907,44 @@ class Downloader:
                 self.state = "probing"
             for attempt in range(4):              # the probe can be throttled too
                 try:
-                    self.url, self.size, self.ranged, auto_name = probe(self.routes[0], self.url)
+                    info = probe(self.routes[0], self.url)
                     break
                 except urllib.error.HTTPError as e:
                     if e.code not in THROTTLE_CODES or attempt == 3 or self._stop.wait(2 ** (attempt + 1)):
                         raise
+            self.url, self.size, self.ranged = info.url, info.size, info.ranged
+            self.etag, self.modified = info.etag, info.modified
+
+            if self.resume_part:                  # the user picked a partial file to continue
+                target = self.resume_part[:-len(".part")]
+            else:
+                target = os.path.join(self.folder, safe_name(self.filename or info.name))
+            segments, why_not = self._load_partial(target)
+            if segments is None and self.resume_part:
+                raise IOError(f"can't continue {os.path.basename(self.resume_part)}: {why_not}")
+            if segments is None:
+                if os.path.exists(target + ".part"):
+                    self.note = f"existing partial file not reused ({why_not}) - saving as a new file"
+                target = unique_path(target)
+            done = sum(s.done for s in segments) if segments else 0
+
             if self.size:
                 import shutil
-                free = shutil.disk_usage(self.folder).free
-                if self.size > free:
-                    raise IOError(f"not enough disk space: the file is {human_size(self.size)}, "
-                                  f"{human_size(free)} free")
-            self.path = unique_path(os.path.join(self.folder, safe_name(self.filename or auto_name)))
-            self.filename = os.path.basename(self.path)
-            self.part = self.path + ".part"
-            self._plan()
-            with open(self.part, "wb") as f:
-                if self.size:
-                    set_size_sparse(f, self.size)     # so segments can write anywhere
+                free = shutil.disk_usage(os.path.dirname(target) or ".").free
+                if self.size - done > free:
+                    raise IOError(f"not enough disk space: {human_size(self.size - done)} still to "
+                                  f"download, {human_size(free)} free")
+            self.path, self.part = target, target + ".part"
+            self.folder, self.filename = os.path.dirname(target), os.path.basename(target)
+            if segments is None:
+                self._plan()
+                with open(self.part, "wb") as f:
+                    if self.size:
+                        set_size_sparse(f, self.size)     # so segments can write anywhere
+            else:
+                self.segments = segments
+                self._plan_workers(self.connections)
+            self.save_state()
         except Exception as e:
             with self._lock:
                 if self._cancelled:
@@ -843,6 +961,82 @@ class Downloader:
             else:
                 self._launch()
 
+    # -- resuming ------------------------------------------------------------- #
+
+    @property
+    def state_path(self):
+        return self.part + STATE_SUFFIX if self.part else None
+
+    def save_state(self):
+        """Write the progress record next to the .part so the download can be
+        continued after the app closes. Only for resumable (ranged, sized) downloads."""
+        with self._state_lock:
+            if (self._state_final or not (self.part and self.segments and self.ranged and self.size)
+                    or not os.path.exists(self.part)):
+                return
+            with self._seg_lock:
+                segs = [[s.start, s.end, s.done] for s in self.segments]
+            record = {"version": 1, "url": self.orig_url, "final_url": self.url, "size": self.size,
+                      "etag": self.etag, "modified": self.modified, "filename": self.filename,
+                      "segments": segs, "saved": time.time()}
+            tmp = self.state_path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(record, f)
+                os.replace(tmp, self.state_path)      # atomic: never a half-written record
+            except OSError:
+                pass
+
+    def _autosave(self):
+        while not self._stop.wait(STATE_SAVE_EVERY):
+            if self.state != "downloading":       # finished/cancelled: the supervisor has the last word
+                return
+            self.save_state()
+
+    def _load_partial(self, target):
+        """Segments for an existing `target`.part, or (None, reason) if it can't be continued.
+
+        With a progress record (.part.fdl) the done ranges are exact. Without one - the
+        app crashed, or the file came from an older version - the ranges Windows has
+        allocated in the sparse .part are used instead, minus a safety margin at each
+        end (a range's last write may have been cut short, and allocation is rounded
+        to whole clusters)."""
+        part = target + ".part"
+        if not os.path.exists(part):
+            return None, "no partial file"
+        if not (self.ranged and self.size):
+            return None, "the server doesn't support resuming (no byte ranges)"
+        if os.path.getsize(part) != self.size:
+            return None, (f"its size ({human_size(os.path.getsize(part))}) doesn't match "
+                          f"the file on the server ({human_size(self.size)})")
+        record = None
+        try:
+            with open(part + STATE_SUFFIX, encoding="utf-8") as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if record:
+            if record.get("size") != self.size:
+                return None, "the progress record is for a different file size"
+            for key, now in (("etag", self.etag), ("modified", self.modified)):
+                if record.get(key) and now and record[key] != now:
+                    return None, "the file on the server has changed since"
+            segs = []
+            for start, end, done in record["segments"]:
+                s = Segment(start, end)
+                s.done = max(0, min(done, s.length))
+                s.finished = s.done >= s.length
+                segs.append(s)
+            self.note = f"resumed: {human_size(sum(s.done for s in segs))} already downloaded"
+            return segs, None
+        runs = allocated_ranges(part)
+        if runs is None:
+            return None, "it has no progress record and isn't a sparse file, so what's done can't be told"
+        segs = segments_from_runs(self.size, runs, REPAIR_MARGIN)
+        self.note = (f"recovered a broken download: {human_size(sum(s.done for s in segs))} "
+                     "found intact, fetching the rest")
+        return segs, None
+
     def _plan(self):
         if self.ranged and self.size:
             n = max(1, min(self.connections, self.size // MIN_SEGMENT))
@@ -852,6 +1046,9 @@ class Downloader:
         else:
             n = 1
             self.segments = [Segment(0, None if self.size is None else self.size - 1)]
+        self._plan_workers(n)
+
+    def _plan_workers(self, n):
         self.workers = [Worker(i, i % len(self.routes)) for i in range(n)]
         share = -(-n // len(self.routes))                 # ceil(n / routes)
         self.gates = [RouteGate(start=share, cap=n) for _ in self.routes]
@@ -926,6 +1123,59 @@ class Downloader:
         for t in self._threads:
             t.start()
         threading.Thread(target=self._supervise, daemon=True).start()
+        threading.Thread(target=self._autosave, daemon=True).start()
+        if len(self.routes) > 1:
+            threading.Thread(target=self._rebalance, daemon=True).start()
+
+    def _rebalance(self):
+        """Shift connections toward the routes that are fastest per connection.
+
+        Each connection stays on its route until its request ends, and with open-ended
+        streams that can be the whole download, so a connection stuck on a slow route
+        (e.g. a far-away VPN region) would stay slow. Every REBALANCE_EVERY seconds this
+        measures each route's speed per connection and, if the slowest route with a
+        connection to spare runs at under REBALANCE_RATIO of the best, moves one of its
+        connections to the best route. One move per check avoids see-sawing, and every
+        route keeps at least one connection, so its IP stays in use and keeps being measured.
+        """
+        n = len(self.routes)
+        last_bytes = collections.Counter(self.route_bytes)
+        last_t = time.monotonic()
+        while not self._stop.wait(REBALANCE_EVERY):
+            if self.state != "downloading":
+                return
+            now = time.monotonic()
+            dt, cur = now - last_t, collections.Counter(self.route_bytes)
+            active = collections.Counter(w.route % n for w in self.workers if w.status == "active")
+            for i in range(n):
+                if active[i]:
+                    rate = (cur[i] - last_bytes[i]) / dt / active[i]
+                    old = self.route_rate.get(i)
+                    self.route_rate[i] = rate if old is None else 0.5 * old + 0.5 * rate
+            last_bytes, last_t = cur, now
+
+            gates = self.gates
+            # A route can take another connection if it has a free slot, or if its limit may
+            # grow: below the cap and not rate-limited lately. (Limits otherwise only grow on
+            # new requests, which long-lived streams rarely make.)
+            room = [i for i in range(n) if i in self.route_rate and now >= gates[i].cool_until
+                    and (gates[i].active < gates[i].limit or
+                         (gates[i].limit < gates[i].cap and now - gates[i].last_throttle > RAMP_UP_AFTER))]
+            spare = [i for i in range(n) if active[i] >= 2 and i in self.route_rate]
+            if not room or not spare:
+                continue
+            best = max(room, key=lambda i: self.route_rate[i])
+            worst = min(spare, key=lambda i: self.route_rate[i])
+            if worst == best or self.route_rate[worst] >= REBALANCE_RATIO * self.route_rate[best]:
+                continue
+            for w in self.workers:
+                if w.status == "active" and w.route % n == worst and not w.move:
+                    with self._gate_cond:
+                        if gates[best].active >= gates[best].limit:
+                            gates[best].limit += 1
+                    w.route, w.move = best, True      # _acquire prefers w.route next time
+                    self.moves += 1
+                    break
 
     def _supervise(self):
         for t in self._threads:
@@ -943,10 +1193,12 @@ class Downloader:
                     self.state = "error"
             elif self._stop.is_set():
                 self.state = "paused"
+                self.save_state()
             else:                                 # every connection gave up
                 self.error = next((w.error for w in self.workers if w.error),
                                   "some parts could not be downloaded")
                 self.state = "error"
+                self.save_state()
 
     def _next_segment(self, w):
         """Claim an orphaned segment, or split the biggest remaining one in half."""
@@ -999,7 +1251,7 @@ class Downloader:
             outcome = self._fetch(w, seg, route_idx)   # 3. one request; releases the slot
             if w.bytes > before:
                 retries = 0
-            if outcome in ("ok", "stopped"):
+            if outcome in ("ok", "stopped", "moved"):
                 continue
             if outcome == "throttled":
                 # Don't sit on the piece while waiting for a slot: a live stream can
@@ -1029,6 +1281,7 @@ class Downloader:
         route = self.routes[route_idx]
         w.status = "active"
         throttled, retry_after = False, None
+        w.move = False                            # this new request is already on the chosen route
         try:
             try:
                 if self.ranged:
@@ -1064,6 +1317,8 @@ class Downloader:
                             break
                         seg = w.seg = nxt         # contiguous: the stream is already at nxt.start
                         continue
+                    if w.move:                    # rebalancer: reconnect on a faster route
+                        break
                     data = resp.read(want)
                     if not data:
                         break
@@ -1079,6 +1334,8 @@ class Downloader:
             if seg.length is None or seg.done >= seg.length:
                 seg.finished = True
                 return "ok"
+            if w.move:
+                return "moved"                    # keeps its piece; reconnects on the new route
             raise IOError("connection closed early")
         except Exception as e:
             return "stopped" if self._stop.is_set() else e
@@ -1090,12 +1347,23 @@ class Downloader:
             with open(self.part, "r+b") as f:
                 f.truncate(self.downloaded)
         os.replace(self.part, self.path)
+        self._remove_state()
 
     def _cleanup(self):
         if self.part:
             try:
                 os.remove(self.part)
             except OSError:
+                pass
+            self._remove_state()
+
+    def _remove_state(self):
+        """Done or cancelled: delete the progress record, and never write it again."""
+        with self._state_lock:
+            self._state_final = True
+            try:
+                os.remove(self.state_path)
+            except (OSError, TypeError):
                 pass
 
 
@@ -1136,58 +1404,95 @@ ROUTES_HINT = ("# One route per line; connections are spread across them.\n"
 
 
 class RegionDialog(tk.Toplevel):
-    """Pick PIA OpenVPN regions. Sets self.result to a list of region names."""
+    """Tick PIA OpenVPN regions, at most `max_count`. Sets self.result to the ticked list."""
 
-    def __init__(self, master, regions):
+    def __init__(self, master, regions, selected, max_count):
         super().__init__(master)
         self.title("PIA VPN regions")
         self.transient(master)
-        self.geometry("360x460")
-        self.regions = regions
+        self.geometry("380x520")
+        self.max_count = max_count
         self.result = None
+        self.vars = {}
+        self.rows = {}
 
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, wraplength=330, justify="left", text=(
-            "Each region you add becomes its own tunnel and IP (vpn:<region>). "
-            "Ctrl/Shift-click to pick several.")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(frm, wraplength=350, justify="left", text=(
+            f"Each ticked region becomes its own tunnel and IP. You can pick up to "
+            f"{max_count}: one per connection (your Segments setting), at most "
+            f"{MAX_VPN_TUNNELS}.")).pack(anchor="w", pady=(0, 6))
+
         self.filter_var = tk.StringVar()
         entry = ttk.Entry(frm, textvariable=self.filter_var)
         entry.pack(fill="x")
-        entry.insert(0, "us")
         entry.focus_set()
-        self.filter_var.trace_add("write", lambda *a: self._fill())
+        self.filter_var.trace_add("write", lambda *a: self._filter())
 
+        # scrollable column of checkboxes
         box = ttk.Frame(frm)
         box.pack(fill="both", expand=True, pady=6)
-        self.listbox = tk.Listbox(box, selectmode="extended", activestyle="none")
-        sb = ttk.Scrollbar(box, command=self.listbox.yview)
-        self.listbox.config(yscrollcommand=sb.set)
-        self.listbox.pack(side="left", fill="both", expand=True)
+        canvas = tk.Canvas(box, highlightthickness=0)
+        sb = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+        self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.listbox.bind("<Double-Button-1>", lambda e: self.add())
+        self.canvas = canvas
+        self.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta // 120, "units"))
 
-        btns = ttk.Frame(frm)
-        btns.pack(anchor="e")
-        ttk.Button(btns, text="Add", command=self.add).pack(side="left", padx=(0, 6))
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+        chosen = set(selected)
+        # ticked regions first, then the rest alphabetically
+        for r in sorted(regions, key=lambda r: (r not in chosen, r)):
+            var = tk.BooleanVar(value=r in chosen)
+            cb = ttk.Checkbutton(self.inner, text=r, variable=var, command=self._update)
+            cb.pack(anchor="w")
+            self.vars[r], self.rows[r] = var, cb
+
+        bottom = ttk.Frame(frm)
+        bottom.pack(fill="x")
+        self.count_var = tk.StringVar()
+        self.count_lbl = ttk.Label(bottom, textvariable=self.count_var)
+        self.count_lbl.pack(side="left")
+        ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(bottom, text="Save", command=self.save).pack(side="right", padx=(0, 6))
+        ttk.Button(bottom, text="Clear", command=self.clear).pack(side="right", padx=(0, 6))
         self.bind("<Escape>", lambda e: self.destroy())
-        self.bind("<Return>", lambda e: self.add())
-        self._fill()
+        self.bind("<Return>", lambda e: self.save())
+        self._update()
         self.grab_set()
 
-    def _fill(self):
-        words = self.filter_var.get().lower().split()
-        self.shown = [r for r in self.regions if all(w in r for w in words)]
-        self.listbox.delete(0, "end")
-        for r in self.shown:
-            self.listbox.insert("end", r)
+    def _checked(self):
+        return [r for r, v in self.vars.items() if v.get()]
 
-    def add(self):
-        picked = [self.shown[i] for i in self.listbox.curselection()]
-        if picked:
-            self.result = picked
-            self.destroy()
+    def _update(self):
+        n = len(self._checked())
+        full = n >= self.max_count
+        # the gatekeeper: at the limit, unticked boxes are disabled until one is unticked
+        for r, cb in self.rows.items():
+            cb.state(["disabled"] if full and not self.vars[r].get() else ["!disabled"])
+        self.count_var.set(f"{n} / {self.max_count} selected" + ("  (limit reached)" if full else ""))
+        self.count_lbl.configure(foreground="#b45309" if full else "")
+
+    def _filter(self):
+        words = self.filter_var.get().lower().split()
+        for r, cb in self.rows.items():
+            cb.pack_forget()
+        for r, cb in self.rows.items():
+            if all(w in r for w in words):
+                cb.pack(anchor="w")
+        self.canvas.yview_moveto(0)
+
+    def clear(self):
+        for v in self.vars.values():
+            v.set(False)
+        self._update()
+
+    def save(self):
+        self.result = self._checked()
+        self.destroy()
 
 
 class App(tk.Tk):
@@ -1211,6 +1516,7 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         self._build()
+        self._announce_unfinished()
         self._drop_socks_routes()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(TICK_MS, self._tick)
@@ -1268,7 +1574,8 @@ class App(tk.Tk):
         self.start_btn = ttk.Button(btns, text="Download", command=self.start)
         self.pause_btn = ttk.Button(btns, text="Pause", command=self.toggle_pause, state="disabled")
         self.cancel_btn = ttk.Button(btns, text="Cancel", command=self.cancel, state="disabled")
-        for b in (self.start_btn, self.pause_btn, self.cancel_btn):
+        self.resume_btn = ttk.Button(btns, text="Resume file…", command=self.resume_file)
+        for b in (self.start_btn, self.pause_btn, self.cancel_btn, self.resume_btn):
             b.pack(side="left", padx=(0, 6))
 
         self.progress = ttk.Progressbar(frm, maximum=1000)
@@ -1301,13 +1608,36 @@ class App(tk.Tk):
                 # failover then stay on PIA, so your own IP is never used.
                 specs = [ln.strip() for ln in text.splitlines() if ln.strip().lower().startswith("vpn:")]
                 if not specs:
-                    raise ValueError("'PIA only' needs at least one vpn:<region> route - "
-                                     "add one with 'VPN regions…'")
-                return parse_routes("\n".join(specs), self.vpn)
-            return parse_routes(text, self.vpn)
+                    if not messagebox.askyesno(
+                            "Fast Downloader",
+                            "'PIA only' is ticked, but no VPN regions are in the route list yet.\n\n"
+                            "Pick one or more PIA regions now?"):
+                        return None
+                    self.vpn_regions()
+                    text = self.routes_txt.get("1.0", "end")
+                    specs = [ln.strip() for ln in text.splitlines() if ln.strip().lower().startswith("vpn:")]
+                    if not specs:
+                        return None
+                text = "\n".join(specs)
+            routes = parse_routes(text, self.vpn)
+            regions = {r.tunnel.region for r in routes if r.tunnel}
+            limit = self._max_regions()
+            if len(regions) > limit:
+                raise ValueError(f"{len(regions)} VPN regions, but at most {limit} can be used "
+                                 f"(one per connection in Segments, max {MAX_VPN_TUNNELS}) - "
+                                 "untick some in 'VPN regions…'")
+            return routes
         except ValueError as e:
             messagebox.showerror("Fast Downloader", f"Bad route: {e}")
             return None
+
+    def _max_regions(self):
+        """How many VPN regions may be ticked: one per connection, capped at MAX_VPN_TUNNELS."""
+        try:
+            connections = max(1, min(32, int(self.seg_var.get())))
+        except ValueError:
+            connections = 8
+        return min(MAX_VPN_TUNNELS, connections)
 
     def _drop_socks_routes(self):
         """Remove 'pia' lines left over from the removed PIA SOCKS route."""
@@ -1334,10 +1664,18 @@ class App(tk.Tk):
         except OSError as e:
             messagebox.showerror("Fast Downloader", f"Could not download PIA's region list:\n{describe(e)}")
             return
-        dlg = RegionDialog(self, regions)
+        lines = self.routes_txt.get("1.0", "end-1c").splitlines()
+        current = [ln.strip()[4:].strip().lower() for ln in lines if ln.strip().lower().startswith("vpn:")]
+        dlg = RegionDialog(self, regions, current, self._max_regions())
         self.wait_window(dlg)
-        if dlg.result:
-            self._append_routes([f"vpn:{r}" for r in dlg.result])
+        if dlg.result is None:                        # cancelled
+            return
+        # The ticked set replaces the vpn: lines; other routes stay where they are.
+        kept = [ln for ln in lines if not ln.strip().lower().startswith("vpn:")]
+        while kept and not kept[-1].strip():
+            kept.pop()
+        self.routes_txt.delete("1.0", "end")
+        self.routes_txt.insert("1.0", "\n".join(kept + [f"vpn:{r}" for r in dlg.result]) + "\n")
 
     def _append_routes(self, specs):
         existing = {ln.strip().lower() for ln in self.routes_txt.get("1.0", "end").splitlines()}
@@ -1394,7 +1732,7 @@ class App(tk.Tk):
         self.check_btn.config(state="normal", text="Check IPs")
         messagebox.showinfo("Public IP per route", "\n".join(lines))
 
-    def start(self):
+    def start(self, resume_part=None):
         if self.dl and self.dl.state in ("connecting", "probing", "downloading", "pausing", "paused"):
             return
         url = self.url_var.get().strip()
@@ -1419,8 +1757,51 @@ class App(tk.Tk):
             return
         self._reset_speed()
         self.dl = Downloader(url, folder, self.name_var.get().strip() or None, n, routes,
-                             prestart=self._prestart_for(routes))
+                             prestart=self._prestart_for(routes), resume_part=resume_part)
         self.dl.start()
+
+    def resume_file(self):
+        """Continue a partial download (.part), with or without its progress record."""
+        path = filedialog.askopenfilename(
+            title="Pick a partial download to continue",
+            initialdir=self.dir_var.get() or default_dir(),
+            filetypes=[("Partial downloads", "*.part"), ("All files", "*.*")])
+        if not path:
+            return
+        path = os.path.normpath(path)
+        if not path.endswith(".part"):
+            messagebox.showwarning("Fast Downloader", "Pick a .part file (an unfinished download).")
+            return
+        url = None
+        try:
+            with open(path + STATE_SUFFIX, encoding="utf-8") as f:
+                url = json.load(f).get("url")
+        except (OSError, ValueError):
+            pass
+        if url:
+            self.url_var.set(url)
+        elif not self.url_var.get().strip():
+            messagebox.showinfo(
+                "Fast Downloader",
+                "This partial file has no progress record, so its URL isn't known.\n\n"
+                "Paste the URL it was downloaded from into the URL box, then pick the file again. "
+                "The parts already downloaded are found from the file itself.")
+            return
+        self.dir_var.set(os.path.dirname(path))
+        self.name_var.set("")
+        self.start(resume_part=path)
+
+    def _announce_unfinished(self):
+        """On launch, point out unfinished downloads in the save folder."""
+        folder = self.dir_var.get().strip() or default_dir()
+        try:
+            parts = [n for n in os.listdir(folder) if n.endswith(".part")]
+        except OSError:
+            return
+        if parts:
+            names = ", ".join(n[:-5] for n in parts[:2]) + (" …" if len(parts) > 2 else "")
+            self.status_var.set(f"{len(parts)} unfinished download(s) here ({names}). "
+                                "Click Download with the same URL, or 'Resume file…', to continue.")
 
     def toggle_pause(self):
         dl = self.dl
@@ -1438,14 +1819,26 @@ class App(tk.Tk):
         self.wspeed.clear()
 
     def cancel(self):
-        if self.dl:
-            self.dl.cancel()
+        dl = self.dl
+        if not dl:
+            return
+        if dl.downloaded > 0 and not messagebox.askyesno(
+                "Fast Downloader",
+                f"Cancel and delete the partial file ({human_size(dl.downloaded)} downloaded)?\n\n"
+                "To stop for now and continue later, use Pause instead."):
+            return
+        dl.cancel()
 
     def _on_close(self):
         if self.dl and self.dl.state in ("connecting", "probing", "downloading", "pausing"):
-            if not messagebox.askyesno("Fast Downloader", "A download is in progress. Quit anyway?"):
+            if not messagebox.askyesno(
+                    "Fast Downloader",
+                    "A download is in progress. Quit anyway?\n\nProgress is saved: click Download "
+                    "with the same URL (or use 'Resume file…') to continue later."):
                 return
             self.dl.stop()
+        if self.dl:
+            self.dl.save_state()
         self.vpn.disconnect_all()     # the elevated watchdog also stops them once we exit
         self._save_settings()
         self.destroy()
@@ -1478,6 +1871,7 @@ class App(tk.Tk):
         s = dl.state
         busy = s in ("connecting", "probing", "downloading", "pausing", "paused")
         self.start_btn.config(state="disabled" if busy else "normal")
+        self.resume_btn.config(state="disabled" if busy else "normal")
         self.cancel_btn.config(state="normal" if busy or s == "error" else "disabled")
         if s == "downloading":
             self.pause_btn.config(state="normal", text="Pause")
@@ -1536,6 +1930,10 @@ class App(tk.Tk):
             note = dl.throttle_note()
             if note:
                 mode = note + "  ·  " + mode
+            if dl.moves:
+                mode = f"{dl.moves} connection(s) moved to faster routes  ·  " + mode
+            if dl.note:
+                mode = dl.note + "  ·  " + mode
             self.info_var.set(f"{dl.filename}  ·  {human_size(dl.size)}  ·  {len(dl.workers)} "
                               f"connection(s) over {n_routes} route(s)  ·  {mode}")
         self._draw(dl)
