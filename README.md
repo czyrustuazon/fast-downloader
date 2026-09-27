@@ -3,8 +3,8 @@
 A segmented, multi-connection downloader with a desktop UI. Files are split into
 pieces that download in parallel, optionally over different routes, so the pieces
 come from different IP addresses. A route can be your normal connection, PIA
-OpenVPN tunnels in any region (several at once), PIA's SOCKS5 proxy, a local
-adapter or any HTTP/SOCKS proxy. Idle connections take over the remaining work of
+OpenVPN tunnels in any region (several at once), a local adapter or an HTTP
+proxy. Idle connections take over the remaining work of
 slow ones, so a slow route never holds up the finish. Each server's rate limits
 are learned automatically.
 
@@ -22,8 +22,7 @@ powershell -ExecutionPolicy Bypass -File create_shortcut.ps1
 Requirements:
 
 - Windows 10/11 and Python 3.9+ with Tkinter (included in standard Windows installs).
-  Otherwise only the standard library is used.
-- SOCKS routes, including `pia`, also need `pip install PySocks`.
+  Only the standard library is used.
 - `vpn:` routes also need [OpenVPN Community](https://openvpn.net/community/) 2.7+ and
   administrator rights (one UAC prompt per connect).
 
@@ -35,81 +34,15 @@ them in turn; list a route twice to give it more connections.
 | Route | Meaning |
 |---|---|
 | `direct` | Your normal connection |
-| `pia` | PIA's SOCKS5 proxy, Netherlands only (see below) |
 | `vpn:us_east` | A PIA OpenVPN tunnel to that region, one IP per region (see [PIA over OpenVPN](#pia-over-openvpn)) |
-| `10.8.0.2` | Bind to this local IP, e.g. a VPN adapter (**Add local IPs** lists them) |
+| `10.8.0.2` | Bind to this local IP, e.g. another network adapter (**Add local IPs** lists them) |
 | `http://host:port` | HTTP proxy (`user:pass@` allowed) |
-| `socks5://user:pass@host:port` | SOCKS5 proxy (`socks5h://` resolves DNS through the proxy) |
 
 **Check IPs** shows the public IP each route actually gets.
 
-**PIA only:** tick this to use only the PIA routes in the list (`pia` and any
-`vpn:` regions), or `pia` if the list has none. Your own IP is never used for
-downloading, even if PIA fails; the download stops with an error instead. Site
-names are still looked up by your own DNS, and **PIA… → Test** still checks your
-own IP for comparison.
-
-## PIA setup
-
-The `pia` route uses PIA's SOCKS5 proxy. You don't need the PIA app for this, and
-it should **not** be connected in full-tunnel mode. If it is, your `direct`
-route goes through the VPN too, and both routes get the same IP.
-
-### 1. Get your SOCKS credentials
-
-The proxy needs **separate credentials from your normal PIA login**:
-
-| | Username looks like | Works for the proxy? |
-|---|---|---|
-| Normal PIA account login | `p1234567` | ❌ No: fails with *SOCKS5 authentication failed* |
-| SOCKS credentials | `x1234567` | ✅ Yes |
-
-To generate them:
-
-1. Sign in to the [PIA Client Control Panel](https://www.privateinternetaccess.com/account/client-control-panel).
-2. Go to **Downloads → VPN Settings → SOCKS**.
-3. Click **Generate** (or **Regenerate**) and copy the username and password it shows.
-
-Regenerating invalidates the previous SOCKS password.
-
-### 2. Give them to the app
-
-Use **either** method:
-
-- **`.env` file (recommended):** copy `.env.example` to `.env` in this folder and fill in:
-  ```
-  PIA_SOCKS_USER=x1234567
-  PIA_SOCKS_PASS="the-generated-password"
-  ```
-  Quote the password if it contains `#`, spaces or quotes. `.env` is git-ignored.
-  On the first launch that finds these credentials, `direct` and `pia` are added to your routes.
-- **PIA… button:** enter them in the dialog. Tick *Remember password* to keep them between
-  sessions (stored unencrypted in `%USERPROFILE%\.fast_downloader.json`).
-  Credentials saved in the dialog take priority over `.env`.
-
-### 3. Check it works
-
-Open **PIA… → Test**, or click **Check IPs**. You should see two different public
-IPs: your ISP's for `direct`, and a Netherlands one for `pia`.
-
-### Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `SOCKS5 authentication failed` | You used your normal `p…` login, or the SOCKS password was regenerated. Generate SOCKS credentials (step 1). Freshly generated credentials can take a while to reach every PIA server. The app moves on to the next server automatically, so this only shows if all of them reject you. |
-| `0x04: Host unreachable` | PIA's proxy can't resolve hostnames itself. The `pia` route already resolves names on your PC. If you entered PIA as a custom `socks5h://` route, use `socks5://` instead. |
-| `the 'pia' route needs PIA SOCKS credentials` | Credentials not found: check `.env` is named exactly `.env` (not `.env.txt`) and sits next to `fast_downloader.py`. |
-| `SOCKS routes need PySocks` | Run `pip install PySocks`. |
-| Both routes show the same IP | The PIA app is connected in full-tunnel mode. Disconnect it, or split-tunnel it. |
-
-### Server location
-
-PIA runs its SOCKS5 proxy only in the **Netherlands**
-(`proxy-nl.privateinternetaccess.com:1080`). There is no US or other-country host.
-DNS picks one of about 30 Netherlands servers per lookup. Because PIA's proxy
-can't resolve hostnames, the names of the sites you download from are looked up
-by your own DNS, not through PIA. For other countries, use
-[`vpn:` routes](#pia-over-openvpn).
+**PIA only:** tick this to use only the `vpn:` routes in the list. It needs at least one.
+Your own IP is never used for downloading, even if a tunnel fails; the download
+stops with an error instead. Site names are still looked up by your own DNS.
 
 ## Rate limiting
 
@@ -148,8 +81,8 @@ connection.
 
 1. Install [OpenVPN Community](https://openvpn.net/community/) 2.7+
    (`winget install OpenVPNTechnologies.OpenVPN`).
-2. Add your **normal** PIA login (the `p…` one you use for the PIA app, *not* the SOCKS
-   credentials) to `.env`:
+2. Copy `.env.example` to `.env` and add your **normal** PIA login (the `p…` one you use
+   for the PIA app):
    ```
    PIA_VPN_USER=p1234567
    PIA_VPN_PASS="your-normal-pia-password"
@@ -212,9 +145,14 @@ dl.start()          # runs on background threads; poll dl.state / dl.downloaded
 | `RouteGate` | Per-route adaptive limit: connection cap, cooldown and request spacing (see [Rate limiting](#rate-limiting)). |
 | `Downloader` | Owns the above; states: `connecting → probing → downloading ⇄ pausing → paused → done / error / cancelled`. |
 
-- **Storage:** the output is preallocated as `<name>.part` (`truncate(size)`). Every
-  worker opens it itself and `seek`s to its own offset, so no merging is needed. It's
-  renamed with `os.replace` when every piece is done. Existing names get ` (1)`, ` (2)`… appended.
+- **Storage:** the output is `<name>.part`, created as a **sparse file** at its full size
+  (`set_size_sparse()`: `FSCTL_SET_SPARSE`, then one byte written at the end). On Windows,
+  `truncate()` extends a file by writing zeros, so a 250 GB download would first write
+  250 GB. Sparse, it's instant, and only the parts actually downloaded use disk space.
+  Every worker opens the file itself and `seek`s to its own offset, so no merging is
+  needed. The file is renamed with `os.replace` when every piece is done. Existing names
+  get ` (1)`, ` (2)`… appended. Before starting, the app checks there's enough free disk
+  space for the whole file.
 - **Requests:** requests are open-ended (`Range: bytes=<pos>-`). When a worker reaches the end
   of its piece, `_continue_into()` claims the next piece if it starts exactly there, is
   unclaimed and untouched. The same stream then carries on with no new request.
@@ -243,7 +181,6 @@ Each `Route` wraps a `urllib` opener:
 | `direct` | the default opener (honours system proxy settings) |
 | Local IP | custom `HTTPConnection`/`HTTPSConnection` handlers with `source_address=(ip, 0)` |
 | HTTP proxy | `ProxyHandler` |
-| SOCKS | PySocks `create_connection` inside custom connection classes; TLS is wrapped on top with SNI. With `socks5://` (and `pia`), names are resolved locally to IPv4 first. When a proxy hostname resolves to several servers, PySocks tries each in turn. |
 | `vpn:` | a bound opener built for the tunnel's current IP (rebuilt if the IP changes on reconnect) |
 
 ### PIA over OpenVPN internals
@@ -288,8 +225,8 @@ Each `Route` wraps a `urllib` opener:
 
 | Path | Contents |
 |---|---|
-| `.env` (git-ignored) | `PIA_SOCKS_USER/PASS` (`x…`), `PIA_VPN_USER/PASS` (`p…`), optional `PIA_SOCKS_HOST/PORT`. Parsed by `load_dotenv()`: `KEY=VALUE`, quotes, `export`, `#` comments. Real environment variables win. |
-| `%USERPROFILE%\.fast_downloader.json` | routes, folder, segment count, PIA-only, PIA dialog settings (the password only if *Remember* is ticked) |
+| `.env` (git-ignored) | `PIA_VPN_USER/PASS` (your `p…` PIA login). Parsed by `load_dotenv()`: `KEY=VALUE`, quotes, `export`, `#` comments. Real environment variables win. |
+| `%USERPROFILE%\.fast_downloader.json` | routes, folder, segment count, PIA-only (no credentials) |
 | `pia_openvpn/` (git-ignored) | cached PIA OpenVPN configs |
 | `%TEMP%\fastdl_vpn_*` | per-connect management password files (deleted once used) |
 | `fast_downloader.ico`, `create_shortcut.ps1` | icon; creates Desktop and Start Menu shortcuts running `pythonw.exe` (no console) |
@@ -301,6 +238,6 @@ Tunable constants are at the top of the file: `CHUNK`, `MIN_SEGMENT`, `STEAL_MIN
 
 - Progress isn't saved to disk, so a download can't be resumed after the app closes.
 - Only one download at a time.
-- Site names are always resolved by your own DNS, including for `pia` and `vpn:` routes.
+- Site names are always resolved by your own DNS, including for `vpn:` routes.
 - `vpn:` routes are Windows-only and need administrator rights. They don't coexist with
   the PIA app while it's connected.

@@ -4,25 +4,18 @@ The file is split into byte ranges that are fetched in parallel and written
 straight into a preallocated ``.part`` file, which is renamed when complete.
 
 Each segment can travel over a different *route*, so segments can come from
-different IP addresses (e.g. one over your VPN adapter, one over your normal
-connection, others through SOCKS5 proxies offered by your VPN provider).
+different IP addresses (e.g. your normal connection plus PIA VPN tunnels in
+several regions).
 
 Route syntax (one per line in the UI):
-    direct                         normal connection (system default)
-    10.8.0.2                       bind to this local IP (e.g. a VPN adapter)
-    http://host:port               HTTP proxy  (user:pass@ allowed)
-    socks5://user:pass@host:port   SOCKS5 proxy (needs `pip install PySocks`)
-    socks5h://host:port            SOCKS5, DNS resolved by the proxy
-    pia                            Private Internet Access SOCKS5 proxy, using the
-                                   credentials set in the "PIA…" dialog, or else
-                                   PIA_SOCKS_USER / PIA_SOCKS_PASS from the
-                                   environment or a .env file next to this script
-                                   (see .env.example)
-    vpn:us_east                    a PIA OpenVPN tunnel to that region (needs OpenVPN
-                                   2.7+, PIA_VPN_USER / PIA_VPN_PASS; one UAC prompt
-                                   per connect - see README "PIA over OpenVPN")
+    direct              normal connection (system default)
+    vpn:us_east         a PIA OpenVPN tunnel to that region (needs OpenVPN 2.7+ and
+                        PIA_VPN_USER / PIA_VPN_PASS in .env; one UAC prompt per
+                        connect - see README "PIA over OpenVPN")
+    10.8.0.2            bind to this local IP (e.g. another network adapter)
+    http://host:port    HTTP proxy  (user:pass@ allowed)
 
-Standard library only, except PySocks for SOCKS routes.
+Standard library only.
 """
 
 import collections
@@ -51,8 +44,6 @@ TICK_MS = 200
 SPEED_WINDOW = 3.0                # seconds of history used for the speed readout
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FastDownloader/1.0"
 IP_CHECK_URL = "https://api.ipify.org"
-PIA_HOST = "proxy-nl.privateinternetaccess.com"
-PIA_PORT = 1080
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fast_downloader.json")
 
 
@@ -99,6 +90,26 @@ def unique_path(path):
     while os.path.exists(f"{base} ({i}){ext}"):
         i += 1
     return f"{base} ({i}){ext}"
+
+
+def set_size_sparse(f, size):
+    """Give file `f` its full size without writing it out.
+
+    On Windows, truncate() extends a file by physically writing zeros (a 250 GB
+    download would first write 250 GB of zeros), and writing far past the end of a
+    normal NTFS file makes Windows zero-fill the gap. Marking the file sparse first
+    means only the ranges actually written take disk space or time."""
+    if os.name == "nt":
+        import ctypes, msvcrt
+        from ctypes import wintypes
+        FSCTL_SET_SPARSE = 0x900C4
+        returned = wintypes.DWORD()
+        ctypes.windll.kernel32.DeviceIoControl(
+            wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), FSCTL_SET_SPARSE,
+            None, 0, None, 0, ctypes.byref(returned), None)
+    f.seek(size - 1)
+    f.write(b"\0")                         # sets the size; everything before it is a hole
+    f.flush()
 
 
 def default_dir():
@@ -159,26 +170,6 @@ def load_dotenv(path):
             os.environ[key] = value
 
 
-def env_pia_configured():
-    return bool(os.environ.get("PIA_SOCKS_USER") and os.environ.get("PIA_SOCKS_PASS"))
-
-
-def pia_proxy_url(pia):
-    """Build the SOCKS5 URL for PIA: dialog settings first, then environment / .env."""
-    if pia.get("user") and pia.get("password"):
-        user, password = pia["user"], pia["password"]
-    else:
-        user, password = os.environ.get("PIA_SOCKS_USER"), os.environ.get("PIA_SOCKS_PASS")
-    if not user or not password:
-        raise ValueError("the 'pia' route needs PIA SOCKS credentials - click 'PIA…' or use .env")
-    host = pia.get("host") or os.environ.get("PIA_SOCKS_HOST") or PIA_HOST
-    port = int(pia.get("port") or os.environ.get("PIA_SOCKS_PORT") or PIA_PORT)
-    q = lambda v: urllib.parse.quote(v, safe="")
-    # socks5 (not socks5h): PIA's proxy answers "host unreachable" when asked to
-    # resolve hostnames itself, so names are resolved locally.
-    return f"socks5://{q(user)}:{q(password)}@{host}:{port}"
-
-
 def filename_from(resp, url):
     cd = resp.headers.get("Content-Disposition", "")
     m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", cd, re.I)
@@ -211,44 +202,6 @@ class _ConnHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(self._cls, req, context=self._context, **self._kw)
 
 
-def _socks_connections(parsed):
-    try:
-        import socks  # PySocks
-    except ImportError:
-        raise ValueError("SOCKS routes need PySocks: pip install PySocks") from None
-
-    scheme = parsed.scheme.lower()
-    proxy = dict(
-        proxy_type=socks.SOCKS5 if scheme.startswith("socks5") else socks.SOCKS4,
-        proxy_addr=parsed.hostname,
-        proxy_port=parsed.port or 1080,
-        proxy_rdns=scheme in ("socks5h", "socks4a"),
-        proxy_username=urllib.parse.unquote(parsed.username) if parsed.username else None,
-        proxy_password=urllib.parse.unquote(parsed.password) if parsed.password else None,
-    )
-
-    def open_socket(conn):
-        host = conn.host
-        if not proxy["proxy_rdns"]:
-            # resolve to IPv4 ourselves; proxies often can't reach IPv6 targets
-            try:
-                host = socket.getaddrinfo(host, conn.port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
-            except OSError:
-                pass
-        # when proxy_addr resolves to several servers, PySocks tries each in turn
-        return socks.create_connection((host, conn.port), timeout=conn.timeout, **proxy)
-
-    class SocksHTTPConnection(http.client.HTTPConnection):
-        def connect(self):
-            self.sock = open_socket(self)
-
-    class SocksHTTPSConnection(http.client.HTTPSConnection):
-        def connect(self):
-            self.sock = self._context.wrap_socket(open_socket(self), server_hostname=self.host)
-
-    return SocksHTTPConnection, SocksHTTPSConnection
-
-
 def _bound_opener(ip):
     """An opener whose connections leave from local address `ip`."""
     src = (str(ip), 0)
@@ -262,24 +215,21 @@ def _bound_opener(ip):
 class Route:
     """One way out to the internet. Each has its own urllib opener."""
 
-    def __init__(self, spec, pia=None, vpn=None):
+    def __init__(self, spec, vpn=None):
         self.spec = spec.strip()
         s = self.spec
-        label = None
         self.tunnel = None
-        self.is_pia = s.lower() == "pia"
-        if s.lower().startswith("vpn:"):
+        self.is_vpn = s.lower().startswith("vpn:")
+        if self.is_vpn:
             if vpn is None:
                 raise ValueError("VPN routes are only available in the app")
             self.tunnel = vpn.tunnel(s[4:].strip().lower())
             self.label = f"VPN {self.tunnel.region}"
-            self.is_pia = True
             self._openers = {}                    # tunnel IP -> opener (IP can change on reconnect)
             return
-        if self.is_pia:
-            s = pia_proxy_url(pia or {})
-            label = "PIA " + urllib.parse.urlparse(s).hostname.split(".")[0]
-        no_env_proxy = urllib.request.ProxyHandler({})
+        if s.lower() == "pia":
+            raise ValueError("the PIA SOCKS route was removed - use 'VPN regions…' to add "
+                             "vpn:<region> routes instead")
 
         if s.lower() in ("", "direct"):
             self.label = "direct"
@@ -299,16 +249,11 @@ class Route:
         scheme = parsed.scheme.lower()
         if not parsed.hostname:
             raise ValueError(f"Unrecognised route: {s!r}")
-        self.label = label or f"{scheme}://{parsed.hostname}:{parsed.port or ''}".rstrip(":")
-        if scheme in ("http", "https"):
-            self.opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": s, "https": s}))
-        elif scheme in ("socks5", "socks5h", "socks4", "socks4a"):
-            http_cls, https_cls = _socks_connections(parsed)
-            self.opener = urllib.request.build_opener(
-                no_env_proxy, _ConnHTTPHandler(http_cls), _ConnHTTPSHandler(https_cls))
-        else:
-            raise ValueError(f"Unsupported proxy scheme: {scheme!r}")
+        if scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported proxy scheme: {scheme!r} (only http:// proxies)")
+        self.label = f"{scheme}://{parsed.hostname}:{parsed.port or ''}".rstrip(":")
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": s, "https": s}))
 
     def _current_opener(self):
         if self.tunnel is None:
@@ -331,10 +276,10 @@ class Route:
             return resp.read(64).decode().strip()
 
 
-def parse_routes(text, pia=None, vpn=None):
+def parse_routes(text, vpn=None):
     specs = [ln.strip() for ln in text.splitlines()
              if ln.strip() and not ln.strip().startswith("#")]
-    return [Route(s, pia, vpn) for s in specs] or [Route("direct")]
+    return [Route(s, vpn) for s in specs] or [Route("direct")]
 
 
 # --------------------------------------------------------------------------- #
@@ -869,13 +814,19 @@ class Downloader:
                 except urllib.error.HTTPError as e:
                     if e.code not in THROTTLE_CODES or attempt == 3 or self._stop.wait(2 ** (attempt + 1)):
                         raise
+            if self.size:
+                import shutil
+                free = shutil.disk_usage(self.folder).free
+                if self.size > free:
+                    raise IOError(f"not enough disk space: the file is {human_size(self.size)}, "
+                                  f"{human_size(free)} free")
             self.path = unique_path(os.path.join(self.folder, safe_name(self.filename or auto_name)))
             self.filename = os.path.basename(self.path)
             self.part = self.path + ".part"
             self._plan()
             with open(self.part, "wb") as f:
                 if self.size:
-                    f.truncate(self.size)         # preallocate so segments can seek anywhere
+                    set_size_sparse(f, self.size)     # so segments can write anywhere
         except Exception as e:
             with self._lock:
                 if self._cancelled:
@@ -1180,7 +1131,7 @@ class SpeedMeter:
     def clear(self):
         self.samples.clear()
 ROUTES_HINT = ("# One route per line; connections are spread across them.\n"
-               "# direct | pia | vpn:us_east | 10.8.0.2 | http://host:port | socks5://user:pass@host:port\n"
+               "# direct | vpn:us_east (use 'VPN regions…') | 10.8.0.2 | http://host:port\n"
                "direct\n")
 
 
@@ -1239,102 +1190,6 @@ class RegionDialog(tk.Toplevel):
             self.destroy()
 
 
-class PiaDialog(tk.Toplevel):
-    """Collects PIA SOCKS5 credentials. Sets self.result to a dict on Save."""
-
-    def __init__(self, master, pia):
-        super().__init__(master)
-        self.title("PIA SOCKS5 proxy")
-        self.resizable(False, False)
-        self.transient(master)
-        self.result = None
-
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
-        frm.columnconfigure(1, weight=1)
-        ttk.Label(frm, justify="left", wraplength=380, text=(
-            "Use the SOCKS credentials generated in the PIA Client Control Panel "
-            "(\"Generate PPTP/L2TP/SOCKS Password\"). They are different from your "
-            "normal PIA login; the username usually starts with 'x'.")).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self.env = env_pia_configured()
-        if self.env:
-            ttk.Label(frm, foreground="#15803d", wraplength=380, text=(
-                f"Credentials found in .env ({os.environ['PIA_SOCKS_USER']}). Leave the "
-                "fields below blank to use them.")).grid(
-                row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        self.vars = {
-            "user": tk.StringVar(value=pia.get("user", "")),
-            "password": tk.StringVar(value=pia.get("password", "")),
-            "host": tk.StringVar(value=pia.get("host", PIA_HOST)),
-            "port": tk.StringVar(value=str(pia.get("port", PIA_PORT))),
-        }
-        for row, (key, text) in enumerate(
-                [("user", "Username"), ("password", "Password"), ("host", "Server"), ("port", "Port")], 1):
-            ttk.Label(frm, text=text).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(frm, textvariable=self.vars[key], width=40,
-                      show="•" if key == "password" else "").grid(row=row, column=1, sticky="ew", pady=3)
-
-        self.remember = tk.BooleanVar(value=bool(pia.get("password")))
-        ttk.Checkbutton(frm, variable=self.remember,
-                        text=f"Remember password (stored unencrypted in {CONFIG_PATH})").grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        self.test_var = tk.StringVar()
-        ttk.Label(frm, textvariable=self.test_var, wraplength=380).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        self.test_btn = ttk.Button(btns, text="Test", command=self.test)
-        self.test_btn.pack(side="left", padx=(0, 6))
-        ttk.Button(btns, text="Save", command=self.save).pack(side="left", padx=(0, 6))
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
-
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
-
-    def _settings(self):
-        pia = {k: v.get().strip() for k, v in self.vars.items()}
-        pia["remember"] = self.remember.get()
-        return pia
-
-    def test(self):
-        pia = self._settings()
-        self.test_btn.config(state="disabled")
-        self.test_var.set("Testing…")
-
-        def work():
-            try:
-                pia_ip = Route("pia", pia).public_ip()
-                main_ip = Route("direct").public_ip()
-                msg = f"Works. PIA IP: {pia_ip}   (main IP: {main_ip})"
-                if pia_ip == main_ip:
-                    msg += "\nSame as main IP - is the PIA app connected in full-tunnel mode?"
-            except Exception as e:
-                msg = f"Failed: {describe(e)}"
-            self.after(0, lambda: self._tested(msg))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _tested(self, msg):
-        if self.winfo_exists():
-            self.test_btn.config(state="normal")
-            self.test_var.set(msg)
-
-    def save(self):
-        pia = self._settings()
-        if (not pia["user"] or not pia["password"]) and not self.env:
-            messagebox.showwarning("PIA", "Enter the SOCKS username and password.", parent=self)
-            return
-        if not pia["port"].isdigit():
-            messagebox.showwarning("PIA", "Port must be a number.", parent=self)
-            return
-        self.result = pia
-        self.destroy()
-
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1346,18 +1201,17 @@ class App(tk.Tk):
         self.wspeed = collections.defaultdict(SpeedMeter)
         self._last_state = None
         self.cfg = load_config()
-        self.pia = self.cfg.get("pia", {})
+        for key in ("pia", "env_pia_added"):              # settings of the removed SOCKS route
+            self.cfg.pop(key, None)
         self.vpn = VpnManager()
-        icon =os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_downloader.ico")
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_downloader.ico")
         if os.path.exists(icon):
             try:
                 self.iconbitmap(default=icon)
             except tk.TclError:
                 pass
         self._build()
-        if env_pia_configured() and not self.cfg.get("env_pia_added"):
-            self._append_routes(["direct", "pia"])    # once; removing it later sticks
-            self.cfg["env_pia_added"] = True
+        self._drop_socks_routes()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(TICK_MS, self._tick)
 
@@ -1394,7 +1248,6 @@ class App(tk.Tk):
         self.routes_txt.grid(row=3, column=1, sticky="ew", **pad)
         route_btns = ttk.Frame(frm)
         route_btns.grid(row=3, column=2, sticky="n", **pad)
-        ttk.Button(route_btns, text="PIA…", command=self.pia_settings).pack(fill="x", pady=(0, 4))
         ttk.Button(route_btns, text="VPN regions…", command=self.vpn_regions).pack(fill="x", pady=(0, 4))
         self.local_btn = ttk.Button(route_btns, text="Add local IPs", command=self.add_local_ips)
         self.local_btn.pack(fill="x", pady=(0, 4))
@@ -1442,17 +1295,28 @@ class App(tk.Tk):
 
     def _routes(self):
         try:
+            text = self.routes_txt.get("1.0", "end")
             if self.pia_only_var.get():
-                # Keep only PIA routes (pia / vpn:*); every connection, the initial probe
-                # and any failover then stay on PIA, so your own IP is never used.
-                text = self.routes_txt.get("1.0", "end")
-                specs = [ln.strip() for ln in text.splitlines()
-                         if ln.strip().lower() == "pia" or ln.strip().lower().startswith("vpn:")]
-                return parse_routes("\n".join(specs) or "pia", self.pia, self.vpn)
-            return parse_routes(self.routes_txt.get("1.0", "end"), self.pia, self.vpn)
+                # Keep only vpn:* routes; every connection, the initial probe and any
+                # failover then stay on PIA, so your own IP is never used.
+                specs = [ln.strip() for ln in text.splitlines() if ln.strip().lower().startswith("vpn:")]
+                if not specs:
+                    raise ValueError("'PIA only' needs at least one vpn:<region> route - "
+                                     "add one with 'VPN regions…'")
+                return parse_routes("\n".join(specs), self.vpn)
+            return parse_routes(text, self.vpn)
         except ValueError as e:
             messagebox.showerror("Fast Downloader", f"Bad route: {e}")
             return None
+
+    def _drop_socks_routes(self):
+        """Remove 'pia' lines left over from the removed PIA SOCKS route."""
+        lines = self.routes_txt.get("1.0", "end-1c").splitlines()
+        kept = [ln for ln in lines if ln.strip().lower() != "pia"]
+        if len(kept) != len(lines):
+            self.routes_txt.delete("1.0", "end")
+            self.routes_txt.insert("1.0", "\n".join(kept) + "\n")
+            self.status_var.set("The PIA SOCKS route was removed - use 'VPN regions…' to add PIA regions.")
 
     def _prestart_for(self, routes):
         """If any route is a VPN tunnel, a callable that connects them (else None)."""
@@ -1493,22 +1357,8 @@ class App(tk.Tk):
             return
         self._append_routes(ips)
 
-    def pia_settings(self):
-        dlg = PiaDialog(self, self.pia)
-        self.wait_window(dlg)
-        if dlg.result:
-            self.pia = dlg.result
-            self._append_routes(["direct", "pia"])
-            self._save_settings()
-
     def _save_settings(self):
-        pia = dict(self.pia)
-        if not pia.pop("remember", False):
-            pia.pop("password", None)
-        else:
-            pia["remember"] = True
         self.cfg.update(
-            pia=pia,
             routes=self.routes_txt.get("1.0", "end-1c"),
             folder=self.dir_var.get().strip(),
             segments=self.seg_var.get().strip(),
@@ -1681,7 +1531,7 @@ class App(tk.Tk):
             n_routes = len({w.route % len(dl.routes) for w in dl.workers})
             mode = ("resumable, idle connections take over slow parts" if dl.ranged
                     else "server doesn't support ranges — single connection")
-            if all(r.is_pia for r in dl.routes):
+            if all(r.is_vpn for r in dl.routes):
                 mode = "PIA only  ·  " + mode
             note = dl.throttle_note()
             if note:
