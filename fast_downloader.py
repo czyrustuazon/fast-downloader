@@ -1403,6 +1403,96 @@ ROUTES_HINT = ("# One route per line; connections are spread across them.\n"
                "direct\n")
 
 
+HISTORY_MAX = 200                # finished downloads remembered
+
+
+class HistoryDialog(tk.Toplevel):
+    """Finished downloads, newest first. Edits `history` (a list) in place.
+    Sets self.changed if entries were removed, self.reuse to an entry to download again."""
+
+    def __init__(self, master, history):
+        super().__init__(master)
+        self.title("Download history")
+        self.transient(master)
+        self.geometry("720x380")
+        self.history = history
+        self.changed = False
+        self.reuse = None
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        cols = ("finished", "file", "size", "folder")
+        self.tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="extended")
+        for c, text, w in zip(cols, ("Finished", "File", "Size", "Folder"), (130, 250, 80, 240)):
+            self.tree.heading(c, text=text)
+            self.tree.column(c, width=w, anchor="e" if c == "size" else "w")
+        sb = ttk.Scrollbar(frm, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        frm.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-Button-1>", lambda e: self.open_folder())
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for text, cmd in (("Open folder", self.open_folder), ("Download again", self.again),
+                          ("Copy URL", self.copy_url), ("Remove", self.remove)):
+            ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Clear all", command=self.clear).pack(side="right", padx=(0, 6))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._fill()
+        self.grab_set()
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(self.history):
+            path = e.get("path", "")
+            name = os.path.basename(path) + ("" if os.path.exists(path) else "  (file missing)")
+            self.tree.insert("", "end", iid=str(i), values=(
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("finished", 0))),
+                name, human_size(e.get("size")), os.path.dirname(path)))
+
+    def _selected(self):
+        return [self.history[int(i)] for i in self.tree.selection()]
+
+    def open_folder(self):
+        for e in self._selected()[:1]:
+            path = e.get("path", "")
+            if os.path.exists(path):
+                import subprocess
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif os.path.isdir(os.path.dirname(path)):
+                os.startfile(os.path.dirname(path))
+
+    def again(self):
+        sel = self._selected()
+        if sel:
+            self.reuse = sel[0]
+            self.destroy()
+
+    def copy_url(self):
+        sel = self._selected()
+        if sel:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(e["url"] for e in sel))
+
+    def remove(self):
+        for i in sorted((int(i) for i in self.tree.selection()), reverse=True):
+            del self.history[i]
+            self.changed = True
+        self._fill()
+
+    def clear(self):
+        if self.history and messagebox.askyesno(
+                "Download history", "Forget all finished downloads? (The files themselves are kept.)",
+                parent=self):
+            self.history.clear()
+            self.changed = True
+            self._fill()
+
+
 class RegionDialog(tk.Toplevel):
     """Tick PIA OpenVPN regions, at most `max_count`. Sets self.result to the ticked list."""
 
@@ -1528,7 +1618,7 @@ class App(tk.Tk):
         frm.columnconfigure(1, weight=1)
 
         ttk.Label(frm, text="URL").grid(row=0, column=0, sticky="w", **pad)
-        self.url_var = tk.StringVar()
+        self.url_var = tk.StringVar(value=self.cfg.get("last_url", ""))
         url_entry = ttk.Entry(frm, textvariable=self.url_var)
         url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
         url_entry.bind("<Return>", lambda e: self.start())
@@ -1540,7 +1630,7 @@ class App(tk.Tk):
         ttk.Button(frm, text="Browse…", command=self.browse).grid(row=1, column=2, sticky="ew", **pad)
 
         ttk.Label(frm, text="File name").grid(row=2, column=0, sticky="w", **pad)
-        self.name_var = tk.StringVar()
+        self.name_var = tk.StringVar(value=self.cfg.get("last_name", ""))
         ttk.Entry(frm, textvariable=self.name_var).grid(row=2, column=1, sticky="ew", **pad)
         seg_box = ttk.Frame(frm)
         seg_box.grid(row=2, column=2, sticky="e", **pad)
@@ -1575,7 +1665,8 @@ class App(tk.Tk):
         self.pause_btn = ttk.Button(btns, text="Pause", command=self.toggle_pause, state="disabled")
         self.cancel_btn = ttk.Button(btns, text="Cancel", command=self.cancel, state="disabled")
         self.resume_btn = ttk.Button(btns, text="Resume file…", command=self.resume_file)
-        for b in (self.start_btn, self.pause_btn, self.cancel_btn, self.resume_btn):
+        self.history_btn = ttk.Button(btns, text="History…", command=self.show_history)
+        for b in (self.start_btn, self.pause_btn, self.cancel_btn, self.resume_btn, self.history_btn):
             b.pack(side="left", padx=(0, 6))
 
         self.progress = ttk.Progressbar(frm, maximum=1000)
@@ -1701,6 +1792,8 @@ class App(tk.Tk):
             folder=self.dir_var.get().strip(),
             segments=self.seg_var.get().strip(),
             pia_only=self.pia_only_var.get(),
+            last_url=self.url_var.get().strip(),
+            last_name=self.name_var.get().strip(),
         )
         save_config(self.cfg)
 
@@ -1742,6 +1835,15 @@ class App(tk.Tk):
         if not re.match(r"https?://", url, re.I):
             url = "https://" + url
             self.url_var.set(url)
+        if not resume_part:
+            done = self._finished_entry(url)
+            if done and not messagebox.askyesno(
+                    "Fast Downloader",
+                    f"This URL was already downloaded on "
+                    f"{time.strftime('%b %d, %Y %H:%M', time.localtime(done['finished']))} to\n"
+                    f"{done['path']}\n\nDownload it again?"):
+                return
+        self._save_settings()                         # remember the URL/name even if the app dies
         folder = self.dir_var.get().strip() or default_dir()
         try:
             os.makedirs(folder, exist_ok=True)
@@ -1759,6 +1861,38 @@ class App(tk.Tk):
         self.dl = Downloader(url, folder, self.name_var.get().strip() or None, n, routes,
                              prestart=self._prestart_for(routes), resume_part=resume_part)
         self.dl.start()
+
+    # -- history ------------------------------------------------------------ #
+
+    def _history(self):
+        return self.cfg.setdefault("history", [])
+
+    def _finished_entry(self, url):
+        """The most recent history entry for `url` whose file still exists, or None."""
+        for e in self._history():
+            if e.get("url") == url and os.path.exists(e.get("path", "")):
+                return e
+        return None
+
+    def _record_finished(self, dl):
+        """A download completed: add it to the history and clear the URL/name fields."""
+        history = self._history()
+        history.insert(0, {"url": dl.orig_url, "path": dl.path, "size": dl.size,
+                           "finished": time.time()})
+        del history[HISTORY_MAX:]
+        if self.url_var.get().strip() == dl.orig_url:     # unless the user already typed a new one
+            self.url_var.set("")
+            self.name_var.set("")
+        self._save_settings()
+
+    def show_history(self):
+        dlg = HistoryDialog(self, self._history())
+        self.wait_window(dlg)
+        if dlg.changed:
+            self._save_settings()
+        if dlg.reuse:
+            self.url_var.set(dlg.reuse["url"])
+            self.name_var.set(os.path.basename(dlg.reuse["path"]))
 
     def resume_file(self):
         """Continue a partial download (.part), with or without its progress record."""
@@ -1884,6 +2018,7 @@ class App(tk.Tk):
         self.status_lbl.config(foreground="#c0392b" if s == "error" else "")
         if s == "done":
             self.progress.config(mode="determinate", value=1000)
+            self._record_finished(dl)
 
     def _refresh(self, dl):
         now, done = time.monotonic(), dl.downloaded

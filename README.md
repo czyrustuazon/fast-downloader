@@ -26,6 +26,19 @@ Requirements:
 - `vpn:` routes also need [OpenVPN Community](https://openvpn.net/community/) 2.7+ and
   administrator rights (one UAC prompt per connect).
 
+## Remembered fields and history
+
+- **Remembered fields:** the **URL** and **File name** fields are saved when the app closes
+  and when a download starts, and restored on the next launch.
+- **Finished downloads:** when a download completes, both fields are cleared and the
+  download is added to **History…**, which keeps the last 200.
+  - **In the History window:** open the file's folder (or double-click), **Download again**
+    (fills the fields back in), copy URLs, remove entries or clear all. The files themselves
+    are never touched.
+  - **Downloading a finished URL again:** clicking **Download** for a URL that's already
+    finished, with its file still on disk, asks before downloading it again. A second copy
+    gets a new name (`name (1).ext`), so nothing is overwritten.
+
 ## Routes
 
 Enter one route per line in the **Routes** box. Connections are spread across
@@ -283,7 +296,7 @@ Each `Route` wraps a `urllib` opener:
 | Path | Contents |
 |---|---|
 | `.env` (git-ignored) | `PIA_VPN_USER/PASS` (your `p…` PIA login). Parsed by `load_dotenv()`: `KEY=VALUE`, quotes, `export`, `#` comments. Real environment variables win. |
-| `%USERPROFILE%\.fast_downloader.json` | routes, folder, segment count, PIA-only (no credentials) |
+| `%USERPROFILE%\.fast_downloader.json` | routes, folder, segment count, PIA-only, last URL and file name, download history (no credentials) |
 | `<name>.part` + `<name>.part.fdl` | an unfinished download (sparse file) and its progress record |
 | `pia_openvpn/` (git-ignored) | cached PIA OpenVPN configs |
 | `%TEMP%\fastdl_vpn_*` | per-connect management password files (deleted once used) |
